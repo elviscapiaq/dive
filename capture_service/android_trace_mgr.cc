@@ -25,8 +25,8 @@ limitations under the License.
 
 extern "C"
 {
-    void SetCaptureState(int state);
-    void SetCaptureName(const char* name, const char* frame_num);
+    void SetCaptureState(int state){};
+    void SetCaptureName(const char* name, const char* frame_num){};
 }
 
 namespace

@@ -233,10 +233,10 @@ absl::Status OpenXRApplication::Setup()
     absl::StrFormat("push %s %s",
                     ResolveAndroidLibPath(kManifestFileName).generic_string().c_str(),
                     kManifestFilePath)));
-    RETURN_IF_ERROR(m_dev.Adb().Run(absl::StrFormat("shell setprop wrap.%s  LD_PRELOAD=%s/%s",
-                                                    m_package,
-                                                    kTargetPath,
-                                                    kWrapLibName)));
+    // RETURN_IF_ERROR(m_dev.Adb().Run(absl::StrFormat("shell setprop wrap.%s  LD_PRELOAD=%s/%s",
+    //                                                 m_package,
+    //                                                 kTargetPath,
+    //                                                 kWrapLibName)));
     RETURN_IF_ERROR(m_dev.Adb().Run(absl::StrFormat("shell getprop wrap.%s", m_package)));
     LOGD("OpenXRApplication %s Setup done.\n", m_package.c_str());
     return absl::OkStatus();
