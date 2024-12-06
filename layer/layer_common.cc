@@ -54,21 +54,21 @@ bool IsLibwrapLoaded()
 
 ServerRunner::ServerRunner()
 {
-    is_libwrap_loaded = IsLibwrapLoaded();
-    LOGI("libwrap loaded: %d", is_libwrap_loaded);
-    if (is_libwrap_loaded)
-    {
-        server_thread = std::thread(Dive::server_main);
-    }
+    // is_libwrap_loaded = IsLibwrapLoaded();
+    // LOGI("libwrap loaded: %d", is_libwrap_loaded);
+    // if (is_libwrap_loaded)
+    // {
+    //     server_thread = std::thread(Dive::server_main);
+    // }
 }
 
 ServerRunner::~ServerRunner()
 {
-    if (is_libwrap_loaded && server_thread.joinable())
-    {
-        LOGI("Wait for server thread to join");
-        server_thread.join();
-    }
+    // if (is_libwrap_loaded && server_thread.joinable())
+    // {
+    //     LOGI("Wait for server thread to join");
+    //     server_thread.join();
+    // }
 }
 
 ServerRunner &GetServerRunner()

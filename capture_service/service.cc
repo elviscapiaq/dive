@@ -135,11 +135,14 @@ grpc::Status DiveServiceImpl::DownloadFile(grpc::ServerContext             *cont
 void RunServer(uint16_t port)
 {
     std::string     server_address = absl::StrFormat("0.0.0.0:%d", port);
+    LOGI("port =  %d server_addres = %s", port, server_address.c_str());
     DiveServiceImpl service;
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
+    LOGI("Start ServerBUilder\n");
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    LOGI("End ServerBUilder\n");
 
     builder.RegisterService(&service);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
@@ -148,7 +151,7 @@ void RunServer(uint16_t port)
 }
 
 int server_main()
-{
+{   LOGI("I am in server_main\n");
     RunServer(absl::GetFlag(FLAGS_port));
     return 0;
 }

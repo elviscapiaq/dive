@@ -27,6 +27,7 @@ limitations under the License.
 #include "layer_common.h"
 #include "loader_interfaces.h"
 #include "xr_generated_dispatch_table.h"
+#include "capture_service/server.h"
 
 #if defined(__GNUC__) && __GNUC__ >= 4
 #    define LAYER_EXPORT __attribute__((visibility("default")))
@@ -46,6 +47,14 @@ namespace
 const char kDiveXrLayerName[] = "XR_APILAYER_dive";
 }
 
+struct MyServer {
+    std::thread server_thread;
+    MyServer() {
+        LOGI("Servers runs with a global object!!\n");
+        server_thread = std::thread(Dive::server_main);
+    }
+}my_server;
+
 struct XrInstanceData
 {
     XrInstance               instance;
@@ -56,12 +65,12 @@ struct XrSessionData
 {
     XrSession                session;
     XrGeneratedDispatchTable dispatch_table;
-    ServerRunner            &server;
+    // ServerRunner            &server;
 
-    XrSessionData() :
-        server(GetServerRunner())
-    {
-    }
+    // XrSessionData() :
+    //     server(GetServerRunner())
+    // {
+    // }
 };
 
 static thread_local XrInstanceData *last_used_xr_instance_data = nullptr;

@@ -35,9 +35,9 @@ public:
     ServerRunner();
     ~ServerRunner();
 
-private:
-    bool        is_libwrap_loaded;
-    std::thread server_thread;
+// private:
+//     bool        is_libwrap_loaded;
+//     std::thread server_thread;
 };
 
 ServerRunner &GetServerRunner();
