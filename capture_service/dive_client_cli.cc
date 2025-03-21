@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#include <fcntl.h>
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -22,14 +23,26 @@ limitations under the License.
 #include <system_error>
 #include <thread>
 
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include "absl/flags/flag.h"
 #include "absl/flags/internal/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/usage.h"
+#include "absl/strings/str_format.h"
 #include "android_application.h"
 #include "client.h"
 #include "constants.h"
 #include "device_mgr.h"
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 using namespace std::chrono_literals;
 
@@ -279,9 +292,143 @@ bool run_package(Dive::DeviceManager& mgr,
 
     return ret.ok();
 }
+const int BUFFER_SIZE = 4096;
+const int SERVER_PORT = 19999;
+char      buffer[BUFFER_SIZE];
+
+bool download_file(int client_socket, const std::string& remote_filename)
+{
+    // 1. Send filename
+    if (send(client_socket, remote_filename.c_str(), remote_filename.length(), 0) !=
+        remote_filename.length())
+    {
+        std::cout << "Error sending filename\n";
+        close(client_socket);
+        return false;
+    }
+    std::cout << "Succes sending filename from client\n";
+
+    // 3. Receive file size
+    long long bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+    if (bytes_received <= 0)
+    {
+        std::cout << "Error receiving file size or connection closed\n";
+        close(client_socket);
+        return false;
+    }
+    buffer[bytes_received] = '\0';
+
+    long long file_size = std::stoll(buffer);
+    std::cout << "Downloading file of size: " << file_size << " bytes" << std::endl;
+
+    // 4. Receive file content
+    std::string local_filename = absl::StrFormat("capture_%lld.rd", file_size);
+    std::cout << "local_filename = " << local_filename << "\n";
+
+    std::ofstream output_file(local_filename, std::ios::binary);
+    if (!output_file.is_open())
+    {
+        std::cout << "Could not open local file for writing: " << local_filename << std::endl;
+        close(client_socket);
+        return false;
+    }
+
+    long long total_received = 0;
+    while (total_received < file_size)
+    {
+        bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+        if (bytes_received == 0)
+        {
+            std::cout << "bytes received 0, finished!\n";
+            break;
+        }
+        else if (bytes_received < 0)
+        {
+            std::cout << "Error receiving file content\n";
+            close(client_socket);
+            output_file.close();
+            return false;
+        }
+        // if (bytes_received != BUFFER_SIZE)
+        // {
+        //     std::cout << "bytes_received != BUFFER_SIZE " << bytes_received << std::endl;
+        //     return false;
+        // }
+        output_file.write(buffer, bytes_received);
+        total_received += bytes_received;
+        // std::cout << "Bytes received = " << bytes_received << "\n";
+        // std::cout << " Received " << total_received << " / " << file_size << " bytes\n";
+    }
+
+    if (total_received == file_size)
+    {
+        std::cout << "Download complete.\n";
+    }
+    else
+    {
+        std::cout << "Download incomplete. Received " << total_received << " out of " << file_size
+                  << " bytes.\n";
+    }
+
+    output_file.close();
+    return true;
+}
+
+bool trigger_capture_with_socket(Dive::DeviceManager& mgr)
+{
+    std::cout << "trigger_capture_with_socket()\n";
+    int client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_socket < 0)
+    {
+        std::cout << "Socket creation errorl\n";
+        return false;
+    }
+
+    sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+
+    // Convert IPv4 and IPv6 addresses from text to binary form
+    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) < 0)
+    {
+        std::cout << "Invalid address or address not supported\n";
+        return false;
+    }
+
+    // int flags = fcntl(client_socket, F_GETFL, 0);
+    // fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
+
+    // flags = fcntl(client_socket, F_GETFD, 0);
+    // fcntl(client_socket, F_SETFD, flags | FD_CLOEXEC);
+
+    if (connect(client_socket, (sockaddr*)&server_addr, sizeof(server_addr)) < 0)
+    {
+        std::cout << "Connection Failed\n";
+        return false;
+    }
+    std::cout << "Client connected with Server\n";
+
+    std::string remote_filename = "/sdcard/Download/trace-frame-0592.rd";
+
+    auto start = std::chrono::high_resolution_clock::now();
+    if (!download_file(client_socket, remote_filename))
+    {
+        std::cout << "Failed to download file\n";
+        // return false;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    // compoute time in seconds
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Time taken to download file: " << duration.count() / 1000.0f << " seconds\n";
+
+    close(client_socket);
+    return true;
+}
 
 bool trigger_capture(Dive::DeviceManager& mgr)
 {
+    return trigger_capture_with_socket(mgr);
+
     std::string target_str = absl::StrFormat("localhost:%d", mgr.GetDevice()->Port());
     std::string download_path = absl::GetFlag(FLAGS_download_path);
     std::string input;
