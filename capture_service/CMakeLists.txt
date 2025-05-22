@@ -89,6 +89,7 @@ else()
               ${COMMAND_UTILS_SRC})
 endif()
 target_link_libraries(service PRIVATE
+                      transfer_server
                       dive_grpc_proto
                       absl::flags
                       absl::flags_parse
@@ -140,6 +141,7 @@ else()
 
   add_executable(dive_client_cli dive_client_cli.cc )
   target_link_libraries(dive_client_cli
+    transfer_client
     dive_grpc_proto
     device_mgr
     client

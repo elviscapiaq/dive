@@ -33,6 +33,7 @@ limitations under the License.
 #include "command_utils.h"
 #include "constants.h"
 #include "device_mgr.h"
+#include "tcp_client.h"
 
 using namespace std::chrono_literals;
 
@@ -297,20 +298,38 @@ bool trigger_capture(Dive::DeviceManager& mgr)
     std::string download_path = absl::GetFlag(FLAGS_download_path);
     std::string input;
 
-    Dive::DiveClient client(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials()));
-    absl::StatusOr<std::string> reply = client.TestConnection();
-    if (reply.ok())
-        std::cout << *reply << std::endl;
-    else
-        std::cout << "TestConnection failed with " << reply.status() << std::endl;
+    std::cout << "Main: Client\n";
+    TransferInfra::TcpClient socket_client;
+    std::string              host = "127.0.0.1";
+    std::string              port = std::to_string(mgr.GetDevice()->Port());
+    std::error_code          ec;
+    if (!socket_client.connect(host, port, ec))
+    {
+        std::cout << "Client failed to connect to " << host << ":" << port << "\n";
+        return false;
+    }
+    std::cout << "Main: Client connected\n";
+    socket_client.startKeepAlive(1, 2000);
 
-    absl::StatusOr<std::string> trace_file_path = client.RequestStartTrace();
-    if (trace_file_path.ok())
-        std::cout << "Trigger capture: " << *trace_file_path << std::endl;
-    else
-        std::cout << "Failed to trigger capture: " << trace_file_path.status() << std::endl;
+    std::string path;
+    ec.clear();
+    path = socket_client.startCapture(ec);
+    // std::this_thread::sleep_for(std::chrono::seconds(10));
 
-    std::filesystem::path p(*trace_file_path);
+    // Dive::DiveClient client(grpc::CreateChannel(target_str,
+    // grpc::InsecureChannelCredentials())); absl::StatusOr<std::string> reply =
+    // client.TestConnection(); if (reply.ok())
+    //     std::cout << *reply << std::endl;
+    // else
+    //     std::cout << "TestConnection failed with " << reply.status() << std::endl;
+
+    // absl::StatusOr<std::string> trace_file_path = client.RequestStartTrace();
+    // if (trace_file_path.ok())
+    //     std::cout << "Trigger capture: " << *trace_file_path << std::endl;
+    // else
+    //     std::cout << "Failed to trigger capture: " << trace_file_path.status() << std::endl;
+
+    std::filesystem::path p(path);
     std::filesystem::path target_download_path(download_path);
     if (!std::filesystem::exists(target_download_path))
     {
@@ -321,8 +340,7 @@ bool trigger_capture(Dive::DeviceManager& mgr)
         }
     }
     target_download_path /= p.filename();
-    auto ret = mgr.GetDevice()->RetrieveTrace(*trace_file_path,
-                                              target_download_path.generic_string());
+    auto ret = mgr.GetDevice()->RetrieveTrace(path, target_download_path.generic_string());
     if (ret.ok())
         std::cout << "Capture saved at " << target_download_path << std::endl;
     else

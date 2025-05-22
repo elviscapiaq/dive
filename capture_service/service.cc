@@ -29,10 +29,93 @@ limitations under the License.
 #include "grpcpp/grpcpp.h"
 #include "grpcpp/health_check_service_interface.h"
 #include "log.h"
+#include "message_handler.h"
+#include "messages.h"
+#include "serializable.h"
+#include "socket_connection.h"
+#include "tcp_server.h"
 #include "trace_mgr.h"
 
 namespace Dive
 {
+
+class ServerMessageHandler : public TransferInfra::IMessageHandler
+{
+public:
+    ServerMessageHandler() {}
+    void onConnect() override { LOGI("ServerMessageHandler: onConnect"); }
+    void onDisconnect() override { LOGI("ServerMessageHandler: onDisconnect"); }
+
+    void handleMessage(std::unique_ptr<TransferInfra::ISerializable> msg,
+                       TransferInfra::SocketConnection              *clientConn) override
+    {
+        LOGI("ServerMessageHandler");
+
+        auto tid = std::this_thread::get_id();
+        LOGI("DefaultSrvHdlr (Thread:%d ): RX msg type %d", tid, (int)msg->getMessageType());
+        if (!msg || !clientConn)
+        {
+            LOGI("Null msg/conn");
+            return;
+        }
+
+        if (msg->getMessageType() ==
+            static_cast<uint8_t>(TransferInfra::MessageType::HEARTBEAT_PING))
+        {
+            TransferInfra::HeartbeatMessage *ping = dynamic_cast<TransferInfra::HeartbeatMessage *>(
+            msg.get());
+            if (ping)
+            {
+                LOGI("HeartbeatMessage: ping");
+                TransferInfra::HeartbeatResponseMessage pong;
+                pong.original_timestamp_or_seq = ping->timestamp_or_seq;
+                std::error_code ec_p;
+                if (!sendMessage(clientConn, pong, ec_p))
+                {
+                    LOGI("Send PONG fail: %s", ec_p.message().c_str());
+                }
+            }
+        }
+        else if (msg->getMessageType() ==
+                 static_cast<uint8_t>(TransferInfra::MessageType::HANDSHAKE))
+        {
+            TransferInfra::HandShakeMessage
+            *hs_msg = dynamic_cast<TransferInfra::HandShakeMessage *>(msg.get());
+            if (hs_msg)
+            {
+                LOGI("HandShakeMessage: handshake");
+                TransferInfra::HandShakeMessage hs_response_msg;
+                hs_response_msg.major_version = hs_msg->major_version;
+                hs_response_msg.minor_version = hs_msg->minor_version;
+                std::error_code ec;
+                if (!sendMessage(clientConn, hs_response_msg, ec))
+                {
+                    LOGI("Send Handshake fail: %s", ec.message().c_str());
+                }
+            }
+        }
+        else if (msg->getMessageType() ==
+                 static_cast<uint8_t>(TransferInfra::MessageType::CAPTURE_REQ))
+        {
+            GetTraceMgr().TriggerTrace();
+            GetTraceMgr().WaitForTraceDone();
+            std::string p = GetTraceMgr().GetTraceFilePath();
+
+            TransferInfra::CaptureResponse response;
+            response.data_field = p;
+            LOGI("response.path: %s", p.c_str());
+            std::error_code ec;
+            if (!sendMessage(clientConn, response, ec))
+            {
+                LOGI("Send CaptureResponse fail: %s", ec.message().c_str());
+            }
+        }
+        else
+        {
+            LOGI("DefaultSrvHdlr Msg type %d unhandled by default.", (int)msg->getMessageType());
+        }
+    }
+};
 
 grpc::Status DiveServiceImpl::StartTrace(grpc::ServerContext *context,
                                          const TraceRequest  *request,
@@ -132,19 +215,31 @@ grpc::Status DiveServiceImpl::DownloadFile(grpc::ServerContext             *cont
 
 void RunServer()
 {
+    std::string server_address = kUnixAbstractPath;
+    std::unique_ptr<TransferInfra::IMessageHandler>
+                                              handler = std::make_unique<ServerMessageHandler>();
+    std::unique_ptr<TransferInfra::TcpServer> server = std::make_unique<TransferInfra::TcpServer>(
+    std::move(handler));
+
+    std::error_code ec;
+    if (!server->start(server_address, ec))
+    {
+        LOGI("Main: Failed to start Socket server");
+        return;
+    }
+    LOGI("Main: Server listening on %s", server_address.c_str());
+    // std::this_thread::sleep_for(std::chrono::seconds(20));
     // We use a Unix (local) domain socket in an abstract namespace rather than an internet domain.
     // It avoids the need to grant INTERNET permission to the target application.
     // Also, no file-based permissions apply since it is in an abstract namespace.
-    std::string     server_address = absl::StrFormat("unix-abstract:%s", kUnixAbstractPath);
-    DiveServiceImpl service;
-    grpc::EnableDefaultHealthCheckService(true);
-    grpc::ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    // DiveServiceImpl service;
+    // grpc::EnableDefaultHealthCheckService(true);
+    // grpc::ServerBuilder builder;
+    // builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
 
-    builder.RegisterService(&service);
-    std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-    LOGI("Server listening on %s", server_address.c_str());
-    server->Wait();
+    // builder.RegisterService(&service);
+    // std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+    // server->Wait();
 }
 
 int ServerMain()

@@ -90,6 +90,7 @@ endif()
 option(DIVE_ENABLE_PERFETTO, "Enable functionality to get perfetto trace." OFF)
 include(perfetto.cmake)
 
+add_subdirectory(transfer_infra)
 add_subdirectory(capture_service)
 add_subdirectory(layer)
 add_subdirectory(runtime_layer)
