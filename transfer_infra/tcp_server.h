@@ -36,7 +36,7 @@ class TcpServer
 
     std::list<std::thread> client_threads_;
     std::thread            accept_thread_;
-    std::atomic<bool>      running_ = false;
+    std::atomic<bool>      running_;
     std::string            last_error_;
     mutable std::mutex     server_mutex_;  // Protects client_threads_ and last_error_
 
@@ -53,6 +53,7 @@ public:
 
     // Public API methods
     bool        start(const std::string& server_address, std::error_code& ec);
+    void        wait();
     void        stop();
     bool        isRunning() const;
     std::string getLastError() const;

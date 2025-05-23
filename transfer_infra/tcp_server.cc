@@ -94,7 +94,7 @@ void TcpServer::acceptLoop()
 {
     auto acc_tid = std::this_thread::get_id();
     std::cout << "Server: Acceptor Thread (" << acc_tid << ") started." << std::endl;
-    while (running_.load(std::memory_order_relaxed))
+    while (running_.load())
     {
         LOGI("Waiting for a client connection");
         std::error_code                   ec;
@@ -106,12 +106,12 @@ void TcpServer::acceptLoop()
         }
         else
         {
-            if (running_.load(std::memory_order_relaxed))
+            if (running_.load())
             {
                 std::lock_guard<std::mutex> l(server_mutex_);
                 last_error_ = "Listen sock not open.";
                 std::cerr << "Srv: AccLoop - " << last_error_ << std::endl;
-                running_.store(false, std::memory_order_relaxed);
+                running_ = false;
             }
             break;
         }
@@ -141,7 +141,8 @@ void TcpServer::acceptLoop()
                     ec == std::errc::bad_file_descriptor)
                 {
                     std::cerr << "Srv: AccLoop - Critical listen sock err. Stopping." << std::endl;
-                    running_.store(false, std::memory_order_relaxed);
+                    running_ = false;
+                    ;
                     break;
                 }
             }
@@ -166,7 +167,7 @@ void TcpServer::clientHandlerLoop(std::unique_ptr<SocketConnection> client_conn,
     std::error_code ec;
     try
     {
-        while (running_.load(std::memory_order_relaxed) && client_conn->isOpen())
+        while (running_.load() && client_conn->isOpen())
         {
             LOGI("clientHandlerLoop");
             auto msg = TransferInfra::readMessage(client_conn.get(), ec);  // Pass SocketConnection*
@@ -217,7 +218,7 @@ void TcpServer::clientHandlerLoop(std::unique_ptr<SocketConnection> client_conn,
 bool TcpServer::start(const std::string& server_address, std::error_code& ec)
 {
     std::lock_guard<std::mutex> lock(server_mutex_);
-    if (running_.load(std::memory_order_relaxed))
+    if (running_.load())
     {
         ec = std::make_error_code(std::errc::device_or_resource_busy);
         last_error_ = "Srv already running.";
@@ -232,16 +233,25 @@ bool TcpServer::start(const std::string& server_address, std::error_code& ec)
         listen_socket_.reset();
         return false;
     }
-    running_.store(true, std::memory_order_relaxed);
-    acceptLoop();
-    // accept_thread_ = std::thread(&TcpServer::acceptLoop, this);
-    std::cout << "Server: Started on " << server_address << std::endl;
+    running_ = true;
+    LOGI("Server before acceptLoop on %s", server_address.c_str());
+    accept_thread_ = std::thread(&TcpServer::acceptLoop, this);
+    LOGI("Server after acceptLoop started on %s", server_address.c_str());
     return true;
+}
+
+void TcpServer::wait()
+{
+    while (running_.load())
+    {
+        LOGI("Main thread waiting");
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
 }
 
 void TcpServer::stop()
 {
-    if (!running_.exchange(false, std::memory_order_acq_rel))
+    if (!running_.exchange(false))
     {
         std::cout << "Srv: Stop called, but not running/already stopping." << std::endl;
         if (accept_thread_.joinable())

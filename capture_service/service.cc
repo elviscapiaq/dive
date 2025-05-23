@@ -228,6 +228,7 @@ void RunServer()
         return;
     }
     LOGI("Main: Server listening on %s", server_address.c_str());
+    server->wait();
     // std::this_thread::sleep_for(std::chrono::seconds(20));
     // We use a Unix (local) domain socket in an abstract namespace rather than an internet domain.
     // It avoids the need to grant INTERNET permission to the target application.
