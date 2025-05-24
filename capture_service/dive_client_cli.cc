@@ -311,42 +311,57 @@ bool trigger_capture(Dive::DeviceManager& mgr)
     std::cout << "Main: Client connected\n";
     socket_client.startKeepAlive(1, 2000);
 
-    std::string path;
-    ec.clear();
-    path = socket_client.startCapture(ec);
-    // std::this_thread::sleep_for(std::chrono::seconds(10));
-
-    // Dive::DiveClient client(grpc::CreateChannel(target_str,
-    // grpc::InsecureChannelCredentials())); absl::StatusOr<std::string> reply =
-    // client.TestConnection(); if (reply.ok())
-    //     std::cout << *reply << std::endl;
-    // else
-    //     std::cout << "TestConnection failed with " << reply.status() << std::endl;
-
-    // absl::StatusOr<std::string> trace_file_path = client.RequestStartTrace();
-    // if (trace_file_path.ok())
-    //     std::cout << "Trigger capture: " << *trace_file_path << std::endl;
-    // else
-    //     std::cout << "Failed to trigger capture: " << trace_file_path.status() << std::endl;
-
-    std::filesystem::path p(path);
-    std::filesystem::path target_download_path(download_path);
-    if (!std::filesystem::exists(target_download_path))
+    for (int i = 0; i < 2; i++)
     {
-        std::error_code ec;
-        if (!std::filesystem::create_directories(target_download_path, ec))
-        {
-            std::cout << "error create directory: " << ec << std::endl;
-        }
-    }
-    target_download_path /= p.filename();
-    auto ret = mgr.GetDevice()->RetrieveTrace(path, target_download_path.generic_string());
-    if (ret.ok())
-        std::cout << "Capture saved at " << target_download_path << std::endl;
-    else
-        std::cout << "Failed to retrieve capture file" << std::endl;
+        std::string path;
+        ec.clear();
+        path = socket_client.startCapture(ec);
+        // std::this_thread::sleep_for(std::chrono::seconds(10));
 
-    return ret.ok();
+        // Dive::DiveClient client(grpc::CreateChannel(target_str,
+        // grpc::InsecureChannelCredentials())); absl::StatusOr<std::string> reply =
+        // client.TestConnection(); if (reply.ok())
+        //     std::cout << *reply << std::endl;
+        // else
+        //     std::cout << "TestConnection failed with " << reply.status() << std::endl;
+
+        // absl::StatusOr<std::string> trace_file_path = client.RequestStartTrace();
+        // if (trace_file_path.ok())
+        //     std::cout << "Trigger capture: " << *trace_file_path << std::endl;
+        // else
+        //     std::cout << "Failed to trigger capture: " << trace_file_path.status() << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        std::filesystem::path p(path);
+        std::filesystem::path target_download_path(download_path);
+        if (!std::filesystem::exists(target_download_path))
+        {
+            std::error_code ec;
+            if (!std::filesystem::create_directories(target_download_path, ec))
+            {
+                std::cout << "error create directory: " << ec << std::endl;
+            }
+        }
+        target_download_path /= p.filename();
+        ec.clear();
+        auto ret = socket_client.downloadFileFromServer(path, target_download_path.string(), ec);
+        if (!ret)
+        {
+            std::cout << "Error downloadFileFromServer: " << ec.message() << "\n";
+            return false;
+        }
+        std::cout << "Capture saved at " << target_download_path << std::endl;
+    }
+
+    return true;
+
+    // auto ret = mgr.GetDevice()->RetrieveTrace(path, target_download_path.generic_string());
+    // if (ret.ok())
+    //     std::cout << "Capture saved at " << target_download_path << std::endl;
+    // else
+    //     std::cout << "Failed to retrieve capture file" << std::endl;
+
+    // return ret.ok();
 }
 
 absl::Status is_capture_directory_busy(Dive::DeviceManager& mgr,

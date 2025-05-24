@@ -23,7 +23,8 @@ enum class ClientStatusInternalStatus
     CONNECTING,
     CONNECTED,
     STATUS_ERROR,
-    PINGING
+    PINGING,
+    TRANSFERRING_FILE
 };
 
 class TcpClient
@@ -60,6 +61,12 @@ public:
     std::unique_ptr<ISerializable> receiveMessage(int timeout_ms, std::error_code& ec);
     bool                           pingServer(int timeout_ms, std::error_code& ec);
     std::string                    startCapture(std::error_code& ec);
+    // Downloads a file from the server to a local path.
+    // remote_filename: The name/identifier of the file on the server.
+    // local_save_path: Where to save the downloaded file locally.
+    bool downloadFileFromServer(const std::string& remote_filename,
+                                const std::string& local_save_path,
+                                std::error_code&   ec);
 
     // --- Keep-Alive Management ---
     // Starts the internal keep-alive thread.

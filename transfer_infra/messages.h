@@ -43,6 +43,9 @@ enum class MessageType : uint8_t
     DATA_PACKET = 12,
     HEARTBEAT_PING = 20,
     HEARTBEAT_PONG = 21,
+    DOWNLOAD_FILE_REQUEST = 32,   // Client to Server: "Please send me this file."
+    DOWNLOAD_FILE_RESPONSE = 33,  // Server to Client: "Here are details, then data / File not
+                                  // found."
     UNKNOWN = 0xFF
 };
 
@@ -373,6 +376,180 @@ public:
     }
 };
 
+// Client -> Server: Request to download a file
+class DownloadFileRequestMessage : public ISerializable
+{
+public:
+    std::string remote_filename;  // Filename client wants from server
+
+    static constexpr uint8_t TYPE_ID = static_cast<uint8_t>(MessageType::DOWNLOAD_FILE_REQUEST);
+    uint8_t                  getMessageType() const override { return TYPE_ID; }
+
+    bool serialize(Buffer& dest, std::error_code& ec) const override
+    {
+        ec.clear();
+        dest.clear();
+        uint32_t name_len = static_cast<uint32_t>(remote_filename.length());
+        uint32_t net_name_len = htonl(name_len);
+        dest.resize(sizeof(net_name_len) + name_len);
+        uint8_t* ptr = dest.data();
+        std::memcpy(ptr, &net_name_len, sizeof(net_name_len));
+        ptr += sizeof(net_name_len);
+        if (name_len > 0)
+        {
+            std::memcpy(ptr, remote_filename.data(), name_len);
+        }
+        return true;
+    }
+    bool deserialize(const Buffer& src, std::error_code& ec) override
+    {
+        ec.clear();
+        if (src.size() < sizeof(uint32_t))
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        const uint8_t* ptr = src.data();
+        const uint8_t* end_ptr = src.data() + src.size();
+        uint32_t       net_name_len;
+        std::memcpy(&net_name_len, ptr, sizeof(net_name_len));
+        uint32_t name_len = ntohl(net_name_len);
+        ptr += sizeof(net_name_len);
+        if (ptr + name_len > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        if (name_len > 0)
+        {
+            remote_filename.assign(reinterpret_cast<const char*>(ptr), name_len);
+        }
+        else
+        {
+            remote_filename.clear();
+        }
+        return true;
+    }
+};
+
+// Server -> Client: Response to DownloadFileRequest, provides details before sending data
+class DownloadFileResponseMessage : public ISerializable
+{
+public:
+    std::string filename;       // Filename being sent (can be same as request or canonical)
+    uint64_t    file_size = 0;  // Total size of the file
+    bool        found = false;  // True if file exists and will be sent
+    std::string error_reason;   // If not found or error
+
+    static constexpr uint8_t TYPE_ID = static_cast<uint8_t>(MessageType::DOWNLOAD_FILE_RESPONSE);
+    uint8_t                  getMessageType() const override { return TYPE_ID; }
+
+    bool serialize(Buffer& dest, std::error_code& ec) const override
+    {
+        ec.clear();
+        dest.clear();
+        uint32_t name_len = static_cast<uint32_t>(filename.length());
+        uint32_t net_name_len = htonl(name_len);
+        uint64_t net_file_size = HeartbeatMessage::convert_htonll(file_size);
+        uint8_t  found_byte = found ? 1 : 0;
+        uint32_t reason_len = static_cast<uint32_t>(error_reason.length());
+        uint32_t net_reason_len = htonl(reason_len);
+
+        dest.resize(sizeof(net_name_len) + name_len + sizeof(net_file_size) + sizeof(found_byte) +
+                    sizeof(net_reason_len) + reason_len);
+        uint8_t* ptr = dest.data();
+
+        std::memcpy(ptr, &net_name_len, sizeof(net_name_len));
+        ptr += sizeof(net_name_len);
+        if (name_len > 0)
+        {
+            std::memcpy(ptr, filename.data(), name_len);
+            ptr += name_len;
+        }
+        std::memcpy(ptr, &net_file_size, sizeof(net_file_size));
+        ptr += sizeof(net_file_size);
+        std::memcpy(ptr, &found_byte, sizeof(found_byte));
+        ptr += sizeof(found_byte);
+        std::memcpy(ptr, &net_reason_len, sizeof(net_reason_len));
+        ptr += sizeof(net_reason_len);
+        if (reason_len > 0)
+        {
+            std::memcpy(ptr, error_reason.data(), reason_len);
+        }
+        return true;
+    }
+    bool deserialize(const Buffer& src, std::error_code& ec) override
+    {
+        ec.clear();
+        const size_t min_size = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint8_t) +
+                                sizeof(uint32_t);
+        if (src.size() < min_size)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+
+        const uint8_t* ptr = src.data();
+        const uint8_t* end_ptr = src.data() + src.size();
+
+        uint32_t net_name_len;
+        std::memcpy(&net_name_len, ptr, sizeof(net_name_len));
+        uint32_t name_len = ntohl(net_name_len);
+        ptr += sizeof(net_name_len);
+        if (ptr + name_len > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        if (name_len > 0)
+            filename.assign(reinterpret_cast<const char*>(ptr), name_len);
+        else
+            filename.clear();
+        ptr += name_len;
+
+        if (ptr + sizeof(uint64_t) > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        uint64_t net_file_size;
+        std::memcpy(&net_file_size, ptr, sizeof(net_file_size));
+        file_size = HeartbeatMessage::convert_ntohll(net_file_size);
+        ptr += sizeof(net_file_size);
+
+        if (ptr + sizeof(uint8_t) > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        uint8_t found_byte;
+        std::memcpy(&found_byte, ptr, sizeof(found_byte));
+        found = (found_byte == 1);
+        ptr += sizeof(found_byte);
+
+        if (ptr + sizeof(uint32_t) > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        uint32_t net_reason_len;
+        std::memcpy(&net_reason_len, ptr, sizeof(net_reason_len));
+        uint32_t reason_len = ntohl(net_reason_len);
+        ptr += sizeof(net_reason_len);
+
+        if (ptr + reason_len > end_ptr)
+        {
+            ec = std::make_error_code(std::errc::message_size);
+            return false;
+        }
+        if (reason_len > 0)
+            error_reason.assign(reinterpret_cast<const char*>(ptr), reason_len);
+        else
+            error_reason.clear();
+        return true;
+    }
+};
+
 // --- Message Helper Functions (TLV Framing) ---
 inline bool readFull(SocketConnection* conn, uint8_t* buffer, size_t size, std::error_code& ec)
 {
@@ -475,6 +652,12 @@ inline std::unique_ptr<ISerializable> readMessage(SocketConnection* conn, std::e
     case MessageType::HEARTBEAT_PONG: message = std::make_unique<HeartbeatResponseMessage>(); break;
     case MessageType::CAPTURE_REQ: message = std::make_unique<CaptureRequest>(); break;
     case MessageType::CAPTURE_RSP: message = std::make_unique<CaptureResponse>(); break;
+    case MessageType::DOWNLOAD_FILE_REQUEST:
+        message = std::make_unique<DownloadFileRequestMessage>();
+        break;
+    case MessageType::DOWNLOAD_FILE_RESPONSE:
+        message = std::make_unique<DownloadFileResponseMessage>();
+        break;
     default:
         ec = std::make_error_code(std::errc::illegal_byte_sequence);
         std::cerr << "readMessage: Unknown message type: " << static_cast<int>(type_byte)

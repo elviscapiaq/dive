@@ -471,8 +471,8 @@ std::string TcpClient::startCapture(std::error_code& ec)
         last_error_ = "Capture recv fail: " +
                       (ec ? ec.message() :
                             (connection_ ? connection_->getLastErrorMsg() : "Unknown read err"));
-        if (ec == std::errc::connection_aborted)
-            std::cout << "Client: Server closed during Capture recv." << std::endl;
+
+        std::cout << "TcpClient error: " << last_error_ << std::endl;
         return "";
     }
     if (response_base->getMessageType() == CaptureResponse::TYPE_ID)
@@ -490,6 +490,83 @@ std::string TcpClient::startCapture(std::error_code& ec)
                   std::to_string(HandShakeMessage::TYPE_ID) +
                   ", Got: " + std::to_string(response_base->getMessageType()) + ").";
     return "";
+}
+
+bool TcpClient::downloadFileFromServer(const std::string& remote_filename,
+                                       const std::string& local_save_path,
+                                       std::error_code&   ec)
+{
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    if (status_ != ClientStatusInternalStatus::CONNECTED || !connection_ || !connection_->isOpen())
+    {
+        ec = std::make_error_code(std::errc::not_connected);
+        last_error_ = "DownloadFile: Not connected.";
+        return false;
+    }
+
+    // 1. Send DownloadFileRequest
+    DownloadFileRequestMessage download_req;
+    download_req.remote_filename = remote_filename;
+
+    std::cout << "Client: Requesting to download file '" << remote_filename << "' to '"
+              << local_save_path << "'..." << std::endl;
+    if (!TransferInfra::sendMessage(connection_.get(), download_req, ec))
+    {
+        last_error_ = "DownloadFile: Failed to send download request: " +
+                      (ec ? ec.message() : connection_->getLastErrorMsg());
+        status_ = ClientStatusInternalStatus::STATUS_ERROR;
+        return false;
+    }
+
+    // 2. Receive DownloadFileResponse (contains file metadata or error)
+    std::cout << "Client: Waiting for download offer from server..." << std::endl;
+    auto response_base = TransferInfra::readMessage(connection_.get(), ec);  // Conceptual timeout
+    if (!response_base)
+    {
+        last_error_ = "DownloadFile: Did not receive download response from server: " +
+                      (ec ? ec.message() : connection_->getLastErrorMsg());
+        status_ = ClientStatusInternalStatus::STATUS_ERROR;
+        return false;
+    }
+
+    if (response_base->getMessageType() != DownloadFileResponseMessage::TYPE_ID)
+    {
+        ec = std::make_error_code(std::errc::protocol_error);
+        last_error_ = "DownloadFile: Expected DownloadFileResponse, got type " +
+                      std::to_string(static_cast<int>(response_base->getMessageType()));
+        status_ = ClientStatusInternalStatus::STATUS_ERROR;
+        return false;
+    }
+
+    auto* download_resp = dynamic_cast<DownloadFileResponseMessage*>(response_base.get());
+    if (!download_resp || !download_resp->found)
+    {
+        ec = std::make_error_code(std::errc::no_such_file_or_directory);  // Or from server reason
+        last_error_ = "DownloadFile: Server could not provide file. Reason: " +
+                      (download_resp ? download_resp->error_reason : "Unknown/Invalid response.");
+        return false;
+    }
+
+    std::cout << "Client: Server offering file '" << download_resp->filename << "' ("
+              << download_resp->file_size << " bytes). Starting download..." << std::endl;
+    status_ = ClientStatusInternalStatus::TRANSFERRING_FILE;
+
+    // 3. Receive the actual file data using SocketConnection's method
+    bool file_received_ok = connection_->receiveFile(local_save_path, download_resp->file_size, ec);
+    if (!file_received_ok)
+    {
+        last_error_ = "DownloadFile: Failed during file data reception: " +
+                      (ec ? ec.message() : connection_->getLastErrorMsg());
+        status_ = ClientStatusInternalStatus::STATUS_ERROR;
+        // local_save_path might contain a partial file.
+        return false;
+    }
+
+    std::cout << "Client: File '" << download_resp->filename << "' downloaded successfully to '"
+              << local_save_path << "'." << std::endl;
+    status_ = ClientStatusInternalStatus::CONNECTED;  // Back to connected
+    // Optional: Send a final ACK to server (FileDownloadCompleteAck)
+    return true;
 }
 
 }  // namespace TransferInfra

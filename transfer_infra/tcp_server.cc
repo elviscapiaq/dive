@@ -79,6 +79,7 @@ TcpServer::TcpServer(std::unique_ptr<IMessageHandler> handler_factory) :
 {
     if (!this->handler_factory_)
     {
+        std::cout << "Error injecting handler factory. Assigning default.\n";
         this->handler_factory_ = std::make_unique<MyDefaultMessageHandler>();
     }
     std::cout << "TcpServer: Initialized with injected handler factory." << std::endl;
@@ -90,129 +91,178 @@ TcpServer::~TcpServer()
     stop();
 }
 
-void TcpServer::acceptLoop()
+void TcpServer::acceptAndHandleClientLoop()
 {
-    auto acc_tid = std::this_thread::get_id();
-    std::cout << "Server: Acceptor Thread (" << acc_tid << ") started." << std::endl;
+    auto server_thread_id = std::this_thread::get_id();
+    std::cout << "Server: Accept & Handle Thread (" << server_thread_id << ") started."
+              << std::endl;
+
+    IMessageHandler* current_client_handler = nullptr;
+
     while (running_.load())
     {
-        LOGI("Waiting for a client connection");
-        std::error_code                   ec;
-        std::unique_ptr<SocketConnection> client_socket_conn = nullptr;
-        if (listen_socket_ && listen_socket_->isOpen())
-        {
-            client_socket_conn = listen_socket_
-                                 ->accept(1000, ec);  // accept returns unique_ptr<SocketConnection>
-        }
-        else
-        {
-            if (running_.load())
+        LOGI("Running loop at acceptAndHandleClientLoop");
+        std::error_code ec;
+        // --- Part 1: Accept a single client ---
+        if (!client_connected_.load())
+        {  // Only accept if no client is currently connected
+            LOGI("No client connected");
+            std::cout << "Server Thread (" << server_thread_id
+                      << "): Listening for a new client connection..." << std::endl;
+            if (!listen_socket_ || !listen_socket_->isOpen())
             {
-                std::lock_guard<std::mutex> l(server_mutex_);
-                last_error_ = "Listen sock not open.";
-                std::cerr << "Srv: AccLoop - " << last_error_ << std::endl;
-                running_ = false;
-            }
-            break;
-        }
-        if (client_socket_conn)
-        {  // Successfully accepted
-            LOGI("Server: AccLoop - Accepted client.");
-            auto* handler = handler_factory_.get();
-
-            LOGI("Before thread for clientHandlerLoop");
-            std::thread client_th(
-            [this, conn = std::move(client_socket_conn), h = handler]() mutable {
-                this->clientHandlerLoop(std::move(conn), h);
-            });
-            std::lock_guard<std::mutex> l(server_mutex_);
-            client_threads_.push_back(std::move(client_th));
-            LOGI("After thread for clientHandlerLoop");
-        }
-        else if (ec)
-        {  // Error during accept
-            if (ec != std::errc::timed_out)
-            {  // Ignore timeouts, they are expected
-                std::lock_guard<std::mutex> l(server_mutex_);
-                last_error_ = "Accept err:" + ec.message() + " (" +
-                              (listen_socket_ ? listen_socket_->getLastErrorMsg() : "N/A") + ")";
-                std::cerr << "Srv: AccLoop - " << last_error_ << std::endl;
-                if (!listen_socket_ || !listen_socket_->isOpen() ||
-                    ec == std::errc::bad_file_descriptor)
+                if (running_.load())
                 {
-                    std::cerr << "Srv: AccLoop - Critical listen sock err. Stopping." << std::endl;
-                    running_ = false;
-                    ;
-                    break;
+                    std::lock_guard<std::mutex> lock(server_mutex_);
+                    last_error_ = "Listening socket is not open.";
+                    std::cerr << "Server Thread (" << server_thread_id << "): " << last_error_
+                              << " Stopping." << std::endl;
+                    running_.store(false);  // Critical error
                 }
-            }
-        }
-    }
-    std::cout << "Server: Acceptor Thread (" << acc_tid << ") exiting." << std::endl;
-}
-
-void TcpServer::clientHandlerLoop(std::unique_ptr<SocketConnection> client_conn,
-                                  IMessageHandler*                  handler)
-{
-    if (!client_conn || !handler)
-    {
-        std::cerr << "Srv Err (Thread " << std::this_thread::get_id()
-                  << "): clientHandlerLoop null conn/hdlr." << std::endl;
-        return;
-    }
-    auto cl_tid = std::this_thread::get_id();
-    std::cout << "Server: Client Handler Thread (" << cl_tid << ") started for a client."
-              << std::endl;
-    handler->onConnect();
-    std::error_code ec;
-    try
-    {
-        while (running_.load() && client_conn->isOpen())
-        {
-            LOGI("clientHandlerLoop");
-            auto msg = TransferInfra::readMessage(client_conn.get(), ec);  // Pass SocketConnection*
-            if (msg)
-            {
-                LOGI("handleMessage");
-                handler->handleMessage(std::move(msg), client_conn.get());
-            }
-            else
-            {  // readMessage failed or client disconnected
-                LOGI("readMessage failed or client disconnected");
-                if (ec)
-                {
-                    if (ec != std::errc::connection_aborted && ec != std::errc::timed_out)
-                        LOGI("Srv: ClientHdlr (%d) ReadMsg err: %s (%s)",
-                             cl_tid,
-                             ec.message().c_str(),
-                             client_conn->getLastErrorMsg().c_str());
-                    else if (ec == std::errc::connection_aborted)
-                        LOGI("Srv: ClientHdlr (%d) Conn closed by peer.", cl_tid);
-                }
-                else
-                    std::cout << "Srv: ClientHdlr (" << cl_tid
-                              << ") Conn closed by peer (readMessage null no ec)." << std::endl;
                 break;  // Exit loop
             }
-        }
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "Srv: ClientHdlr (" << cl_tid << ") Exception: " << e.what() << std::endl;
-    }
-    catch (...)
-    {
-        std::cerr << "Srv: ClientHdlr (" << cl_tid << ") Unknown exception." << std::endl;
-    }
 
-    std::cout << "Srv: ClientHdlr (" << cl_tid << ") Calling onDisconnect." << std::endl;
-    handler->onDisconnect();
-    if (client_conn && client_conn->isOpen())
+            // Blocking accept (or with timeout to check running_ flag)
+            auto accepted_conn = listen_socket_->accept(ec);  // 2-second timeout
+
+            if (accepted_conn)
+            {
+                LOGI("New client accepted");
+                std::lock_guard<std::mutex> lock(server_mutex_);  // Protect client_connection_
+                client_connection_ = std::move(accepted_conn);
+                client_connected_.store(true);
+                current_client_handler = handler_factory_.get();
+                std::cout << "Server Thread (" << server_thread_id
+                          << "): Accepted new client. Handler created." << std::endl;
+                if (current_client_handler)
+                    current_client_handler->onConnect();
+            }
+            else if (ec && ec != std::errc::timed_out)
+            {
+                LOGI("Errro accepting new client");
+                std::lock_guard<std::mutex> lock(server_mutex_);
+                last_error_ = "Accept error: " + ec.message();
+                std::cerr << "Server Thread (" << server_thread_id << "): " << last_error_
+                          << std::endl;
+                if (!listen_socket_->isOpen() || ec == std::errc::bad_file_descriptor)
+                {
+                    running_.store(false);  // Critical error with listen socket
+                    break;
+                }
+                // For other errors, might just continue trying to accept
+            }
+            else if (ec == std::errc::timed_out)
+            {
+                LOGI("Accept timed out: continue waiting for new client connection");
+                // Timeout is fine, loop again if running_ is true
+                continue;
+            }
+        }  // End of accept block
+
+        // --- Part 2: Handle the connected client ---
+        if (client_connected_.load() && client_connection_ && client_connection_->isOpen())
+        {
+            // Try to read a message (this part needs to be non-blocking or have a short timeout
+            // to allow the outer loop to check running_ and the client_connected_ status if we want
+            // this single thread to also re-accept quickly after a disconnect).
+            // For true synchronous handling within this loop, readMessage would block.
+            // Let's assume readMessage has some internal timeout or we add select/poll here.
+            // For simplicity in this example, we'll use the blocking readMessage.
+            // If readMessage blocks indefinitely, a new client cannot connect until this one
+            // disconnects.
+
+            // To make the accept loop more responsive if this part blocks for too long on read,
+            // we'd ideally want SocketConnection::recv to have a timeout.
+            // Our current readMessage helper uses blocking recv.
+            // A quick check with a short timeout on poll could be added before readMessage.
+            // For now, we use a simple blocking read.
+
+            auto message = TransferInfra::readMessage(client_connection_.get(), ec);
+
+            if (message)
+            {
+                if (current_client_handler)
+                {
+                    LOGI("handleMessage");
+                    current_client_handler->handleMessage(std::move(message),
+                                                          client_connection_.get());
+                }
+            }
+            else
+            {  // readMessage failed or client disconnected cleanly
+                LOGI("readMessage failed or client disconnected cleanly");
+                if (ec)
+                {
+                    if (ec != std::errc::connection_aborted)
+                    {  // Don't spam for clean disconnects
+                        std::lock_guard<std::mutex> lock(server_mutex_);
+                        last_error_ = "Client handling error (read): " + ec.message();
+                        std::cerr << "Server Thread (" << server_thread_id << "): " << last_error_
+                                  << std::endl;
+                    }
+                }
+                LOGI("Client disconnected or read error. Preparing to accept new client.");
+                if (current_client_handler)
+                    current_client_handler->onDisconnect();
+                {
+                    std::lock_guard<std::mutex> lock(server_mutex_);  // Protect client_connection_
+                    if (client_connection_)
+                        client_connection_->close();
+                    client_connection_.reset();
+                }
+                client_connected_.store(false);
+                // Loop will now go back to accepting
+            }
+        }
+        else if (client_connected_.load() && (!client_connection_ || !client_connection_->isOpen()))
+        {
+            // If we thought a client was connected, but the socket is now bad
+            std::cout << "Server Thread (" << server_thread_id
+                      << "): Previously connected client socket is no longer valid. Resetting."
+                      << std::endl;
+            if (current_client_handler)
+                current_client_handler->onDisconnect();
+            {
+                std::lock_guard<std::mutex> lock(server_mutex_);
+                if (client_connection_)
+                    client_connection_->close();  // Ensure it's closed
+                client_connection_.reset();
+            }
+            client_connected_.store(false);
+        }
+
+        // If running_ is false, the loop will exit.
+        // Add a small sleep if no client is connected to prevent busy-looping on accept timeout
+        if (!client_connected_.load() && running_.load())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));  // Small pause
+        }
+
+    }  // end while(running_)
+
+    // Cleanup if loop exits
+    LOGI("Loop exited at acceptAndHandleClientLoop");
+    std::cout << "Server Thread (" << server_thread_id << "): Loop exited. Cleaning up..."
+              << std::endl;
+    if (client_connected_.load())
     {
-        std::cout << "Srv: ClientHdlr (" << cl_tid << ") Closing client conn." << std::endl;
-        client_conn->close();
+        if (current_client_handler)
+            current_client_handler->onDisconnect();
+        {
+            std::lock_guard<std::mutex> lock(server_mutex_);
+            if (client_connection_)
+                client_connection_->close();
+            client_connection_.reset();
+        }
+        client_connected_.store(false, std::memory_order_relaxed);
     }
-    std::cout << "Server: Client Handler Thread (" << cl_tid << ") exiting." << std::endl;
+    if (listen_socket_ && listen_socket_->isOpen())
+    {
+        listen_socket_->close();
+    }
+    LOGI("Server: Accept & Handle Thread exiting");
+    std::cout << "Server: Accept & Handle Thread (" << server_thread_id << ") exiting fully."
+              << std::endl;
 }
 
 bool TcpServer::start(const std::string& server_address, std::error_code& ec)
@@ -235,7 +285,7 @@ bool TcpServer::start(const std::string& server_address, std::error_code& ec)
     }
     running_ = true;
     LOGI("Server before acceptLoop on %s", server_address.c_str());
-    accept_thread_ = std::thread(&TcpServer::acceptLoop, this);
+    server_thread_ = std::thread(&TcpServer::acceptAndHandleClientLoop, this);
     LOGI("Server after acceptLoop started on %s", server_address.c_str());
     return true;
 }
@@ -253,101 +303,87 @@ void TcpServer::stop()
 {
     if (!running_.exchange(false))
     {
-        std::cout << "Srv: Stop called, but not running/already stopping." << std::endl;
-        if (accept_thread_.joinable())
-        {
+        LOGI("Server (Single Client Mode): Stop called, but server was not running or "
+             "already stopping.");
+        if (server_thread_.joinable())
+        {  // Attempt to join if it was somehow left
             try
             {
-                accept_thread_.join();
+                LOGI("Server: Server thread joined successfully.");
+                server_thread_.join();
             }
             catch (const std::system_error& e)
             {
-                std::cerr << "Srv: Error joining accept_thread during redundant stop: " << e.what()
-                          << std::endl;
-            }
-        }
-        std::list<std::thread> tj;
-        {
-            std::lock_guard<std::mutex> l(server_mutex_);
-            tj.swap(client_threads_);
-        }
-        for (auto& t : tj)
-        {
-            if (t.joinable())
-            {
-                try
-                {
-                    t.join();
-                }
-                catch (const std::system_error& e)
-                {
-                    std::cerr << "Srv: Error joining client_thread during redundant stop: "
-                              << e.what() << std::endl;
-                }
+                LOGI("Server: System error while joining server thread: %s", e.what());
             }
         }
         return;
     }
-    std::cout << "Srv: Stop initiated..." << std::endl;
-    std::cout << "Srv: Closing listen socket..." << std::endl;
-    if (listen_socket_)
-        listen_socket_->close();
+    LOGI("Server (Single Client Mode): Stop sequence initiated...");
 
-    std::cout << "Srv: Joining acceptor thread (" << accept_thread_.get_id() << ")..." << std::endl;
-    if (accept_thread_.joinable())
+    // 1. Signal the server_thread_ loop to stop (done by setting running_ to false)
+    // 2. Close the listening socket to unblock accept() if it's waiting.
+    LOGI("Server: Closing listening socket to unblock server thread...");
+    if (listen_socket_)
+    {
+        listen_socket_->close();
+    }
+
+    // 3. Close the active client connection (if any) to unblock its handler's readMessage()
+    {
+        std::lock_guard<std::mutex> lock(server_mutex_);  // Protect client_connection_
+        if (client_connection_ && client_connection_->isOpen())
+        {
+            LOGI("Server: Closing active client connection to signal handler...");
+            client_connection_->close();
+        }
+    }
+
+    // 4. Notify condition variable if server_thread_ is waiting on it (not used in this simple
+    // loop)
+    stop_cv_.notify_one();  // In case the loop was designed to wait on this
+
+    // 5. Wait for the server_thread_ to finish
+    if (server_thread_.joinable())
     {
         try
         {
-            accept_thread_.join();
-            std::cout << "Srv: Acceptor joined." << std::endl;
+            server_thread_.join();
+            LOGI("Server: Server thread joined successfully.");
         }
         catch (const std::system_error& e)
         {
-            std::cerr << "Srv: Sys err joining acceptor: " << e.what() << std::endl;
+            LOGI("Server: System error while joining server thread: %s", e.what());
         }
     }
     else
     {
-        std::cout << "Srv: Acceptor not joinable on stop." << std::endl;
+        LOGI("Server: Server thread was not joinable upon stop.");
     }
 
-    std::list<std::thread> threads_to_join;
-    {
-        std::lock_guard<std::mutex> l(server_mutex_);
-        threads_to_join.swap(client_threads_);
-    }  // Move threads out of list while holding lock
-
-    std::cout << "Srv: Joining " << threads_to_join.size() << " client threads..." << std::endl;
-    for (auto& t : threads_to_join)
-    {
-        if (t.joinable())
-        {
-            std::cout << "Srv: Joining client thread (" << t.get_id() << ")..." << std::endl;
-            try
-            {
-                t.join();
-            }
-            catch (const std::system_error& e)
-            {
-                std::cerr << "Srv: Sys err joining client thread (" << t.get_id()
-                          << "): " << e.what() << std::endl;
-            }
-        }
-    }
-    // Ensure original list is clear
-    std::lock_guard<std::mutex> l(server_mutex_);
-    client_threads_.clear();
-    std::cout << "Srv: Client threads joined." << std::endl;
-
+    // Reset resources
     if (listen_socket_)
         listen_socket_.reset();
-    std::cout << "Srv: Stopped." << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(server_mutex_);
+        if (client_connection_)
+            client_connection_.reset();
+    }
+    client_connected_.store(false);
+
+    LOGI("Server (Single Client Mode): Stopped completely.");
 }
 
 bool TcpServer::isRunning() const
 {
-    return running_.load(std::memory_order_relaxed);
+    return running_.load();
 }
+
+bool TcpServer::isClientConnected() const
+{
+    return client_connected_.load();
+}
+
 std::string TcpServer::getLastError() const
 {
     std::lock_guard<std::mutex> l(server_mutex_);

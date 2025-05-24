@@ -42,6 +42,8 @@ private:
     std::string               last_error_msg_;
     bool                      is_listening_ = false;
     static NetworkInitializer network_init_ensure_;  // Ensures global_initializer_ is constructed
+    int                       recv_timeout_ms_ = 30000;
+    int                       accept_timout_ms = 2000;
 
     void setError(const std::error_code& ec, const std::string& context = "");
     void setPlatformError(const std::string& context = "");
@@ -60,8 +62,7 @@ public:
 
     // Server-side methods
     bool bindAndListenOnUnixDomain(const std::string& server_address, std::error_code& ec);
-    std::unique_ptr<SocketConnection> accept(int              timeoutMs,
-                                             std::error_code& ec);  // Returns concrete type
+    std::unique_ptr<SocketConnection> accept(std::error_code& ec);  // Returns concrete type
 
     // Client-side method
     bool connect(const std::string& host, const std::string& port, std::error_code& ec);

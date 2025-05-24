@@ -97,6 +97,7 @@ public:
         else if (msg->getMessageType() ==
                  static_cast<uint8_t>(TransferInfra::MessageType::CAPTURE_REQ))
         {
+            LOGI("CaptureRequest: capture request");
             GetTraceMgr().TriggerTrace();
             GetTraceMgr().WaitForTraceDone();
             std::string p = GetTraceMgr().GetTraceFilePath();
@@ -108,6 +109,75 @@ public:
             if (!sendMessage(clientConn, response, ec))
             {
                 LOGI("Send CaptureResponse fail: %s", ec.message().c_str());
+            }
+        }
+
+        else if (msg->getMessageType() ==
+                 static_cast<uint8_t>(TransferInfra::MessageType::DOWNLOAD_FILE_REQUEST))
+        {
+            LOGI("DownloadFileRequest: download request");
+            auto *download_req = dynamic_cast<TransferInfra::DownloadFileRequestMessage *>(
+            msg.get());
+            if (download_req)
+            {
+                LOGI("Server RX DownloadFileRequest for: %s",
+                     download_req->remote_filename.c_str());
+                TransferInfra::DownloadFileResponseMessage download_resp;
+                std::string server_file_full_path = download_req->remote_filename;
+
+                std::ifstream file_to_send(server_file_full_path, std::ios::binary | std::ios::ate);
+                if (file_to_send.is_open())
+                {
+                    std::streamsize file_size_streamsize = file_to_send.tellg();
+                    file_to_send.close();  // Closed after getting size
+
+                    if (file_size_streamsize >= 0)
+                    {
+                        download_resp.found = true;
+                        download_resp.filename = server_file_full_path;
+                        download_resp.file_size = static_cast<uint64_t>(file_size_streamsize);
+                        std::cout << "[Server Handler] Offering file '" << server_file_full_path
+                                  << "' (" << download_resp.file_size << " bytes)." << std::endl;
+                    }
+                    else
+                    {
+                        download_resp.found = false;
+                        download_resp.error_reason = "Could not determine file size.";
+                        std::cerr << "[Server Handler] Could not get size for file: "
+                                  << server_file_full_path << std::endl;
+                    }
+                }
+                else
+                {
+                    download_resp.found = false;
+                    download_resp.error_reason = "File not found or access denied.";
+                    std::cerr << "[Server Handler] File not found or no access: "
+                              << server_file_full_path << std::endl;
+                }
+
+                std::error_code ec;
+                if (!TransferInfra::sendMessage(clientConn, download_resp, ec))
+                {
+                    LOGI("[Server Handler] Failed to send DownloadFileResponse: %s",
+                         ec.message().c_str());
+                }
+                if (download_resp.found)
+                {
+                    LOGI("[Server Handler] Sending file data for: %s",
+                         server_file_full_path.c_str());
+                    if (clientConn->sendFile(server_file_full_path, ec))
+                    {
+                        LOGI("[Server Handler] File %s sent successfully.",
+                             server_file_full_path.c_str());
+                    }
+                    else
+                    {
+                        LOGI("[Server Handler] Failed to send file data for %s : %s (%s)",
+                             server_file_full_path.c_str(),
+                             ec.message().c_str(),
+                             clientConn->getLastErrorMsg().c_str());
+                    }
+                }
             }
         }
         else

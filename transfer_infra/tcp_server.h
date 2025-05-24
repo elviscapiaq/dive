@@ -7,6 +7,7 @@
 #include "socket_connection.h"  // Direct use of SocketConnection
 
 #include <atomic>
+#include <condition_variable>  // For signaling during shutdown
 #include <functional>
 #include <iostream>
 #include <list>
@@ -30,18 +31,22 @@ public:
 };
 
 class TcpServer
-{                                                      // No longer inherits IServer
-    std::unique_ptr<SocketConnection> listen_socket_;  // Direct use
+{
+    std::unique_ptr<SocketConnection> listen_socket_;      // For accepting connections
+    std::unique_ptr<SocketConnection> client_connection_;  // For the single active client
     std::unique_ptr<IMessageHandler>  handler_factory_;
 
-    std::list<std::thread> client_threads_;
-    std::thread            accept_thread_;
-    std::atomic<bool>      running_;
-    std::string            last_error_;
-    mutable std::mutex     server_mutex_;  // Protects client_threads_ and last_error_
+    std::thread       server_thread_;              // Single thread for accept and client handling
+    std::atomic<bool> running_{ false };           // Controls server running state
+    std::atomic<bool> client_connected_{ false };  // Tracks if a client is currently connected
 
-    void acceptLoop();
-    void clientHandlerLoop(std::unique_ptr<SocketConnection> client_conn, IMessageHandler* handler);
+    std::string last_error_;
+    mutable std::mutex
+    server_mutex_;  // Protects shared state like last_error_ and client_connection_
+    std::condition_variable stop_cv_;  // For stop() to signal server_thread_
+
+    // Single loop for accepting one client and then handling it.
+    void acceptAndHandleClientLoop();
 
 public:
     // Constructor uses default SocketConnection creation internally and default message handler
@@ -56,6 +61,7 @@ public:
     void        wait();
     void        stop();
     bool        isRunning() const;
+    bool        isClientConnected() const;  // New method to check client status
     std::string getLastError() const;
 };
 }  // namespace TransferInfra

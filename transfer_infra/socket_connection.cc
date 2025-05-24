@@ -313,26 +313,104 @@ size_t SocketConnection::recv(uint8_t* data, size_t size, std::error_code& ec)
     if (socket_ == INVALID_SOCK_VALUE || is_listening_)
     {
         ec = std::make_error_code(std::errc::not_connected);
-        setError(ec);
+        setError(ec, "Recv on non-connected or listening socket");
         return 0;
     }
     if (size == 0)
         return 0;
-    ssize_t recvd;
+
+    // 1. Wait for data to be available using poll/select with timeout
 #ifdef _WIN32
-    recvd = ::recv(static_cast<SOCKET>(socket_), (char*)data, (int)size, 0);
-#else
-    recvd = ::recv(socket_, data, size, 0);
-#endif
-    if (recvd == -1)
+    TIMEVAL tv;
+    fd_set  readfds;
+    FD_ZERO(&readfds);
+    FD_SET(static_cast<SOCKET>(socket_), &readfds);
+
+    if (recv_timeout_ms_ >= 0)
+    {  // Negative timeout means block indefinitely
+        tv.tv_sec = recv_timeout_ms_ / 1000;
+        tv.tv_usec = (recv_timeout_ms_ % 1000) * 1000;
+    }
+    // For Windows, select's first argument is ignored.
+    int activity = select(0, &readfds, nullptr, nullptr, (recv_timeout_ms_ < 0) ? nullptr : &tv);
+
+    if (activity == SOCKET_ERROR)
     {
-        setPlatformError("recv op");
-        int e = 0;
+        setPlatformError("select failed during recv");
+        ec = std::make_error_code(std::errc::io_error);
+        return 0;
+    }
+    if (activity == 0)
+    {  // Timeout
+        ec = std::make_error_code(std::errc::timed_out);
+        setError(ec, "Recv timed out waiting for data");
+        return 0;
+    }
+    // If activity > 0, socket_ is ready for recv
+#else  // POSIX
+    struct pollfd pfd;
+    pfd.fd = socket_;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int ret = poll(&pfd, 1, recv_timeout_ms_);
+    // recv_timeout_ms_ = -1 for infinite, 0 for non-blocking, > 0 for ms
+
+    if (ret < 0)
+    {  // Error
+        setPlatformError("poll failed during recv");
+        ec = std::make_error_code(std::errc::io_error);
+        return 0;
+    }
+    if (ret == 0)
+    {  // Timeout
+        ec = std::make_error_code(std::errc::timed_out);
+        setError(ec, "Recv timed out waiting for data");
+        return 0;
+    }
+    // If ret > 0, check revents
+    if (!(pfd.revents & POLLIN))
+    {
+        // Socket closed or error event (POLLHUP, POLLERR, POLLNVAL)
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+        {
+            // Determine more specific error if possible, or treat as connection reset/aborted
+            setPlatformError("poll error event on socket during recv");
+            ec = std::make_error_code(std::errc::connection_reset);  // Or connection_aborted
+            close();  // Close the socket as it's in an error state
+        }
+        else
+        {
+            ec = std::make_error_code(std::errc::io_error);  // Unexpected poll result
+            setError(ec, "Poll unexpected event on socket during recv");
+        }
+        return 0;
+    }
+#endif
+
+    // 2. Data is available, now perform the actual recv
+    ssize_t bytes_received;
 #ifdef _WIN32
-        e = WSAGetLastError();
-        if (e == WSAEWOULDBLOCK)
+    // For a blocking socket (which is implied after select/poll succeeds),
+    // this recv should not block for long if data was indicated.
+    bytes_received = ::recv(static_cast<SOCKET>(socket_),
+                            reinterpret_cast<char*>(data),
+                            static_cast<int>(size),
+                            0);
+#else
+    bytes_received = ::recv(socket_, data, size, 0);  // Flags = 0 for standard blocking recv
+#endif
+
+    if (bytes_received == -1)
+    {
+        setPlatformError("recv operation failed after poll/select indicated readiness");
+#ifdef _WIN32
+        int wsa_err = WSAGetLastError();
+        // WSAEWOULDBLOCK should not happen here if select/poll worked correctly, but handle
+        // defensively
+        if (wsa_err == WSAEWOULDBLOCK)
             ec = std::make_error_code(std::errc::operation_would_block);
-        else if (e == WSAECONNRESET || e == WSAECONNABORTED || e == WSAESHUTDOWN)
+        else if (wsa_err == WSAECONNRESET || wsa_err == WSAECONNABORTED || wsa_err == WSAESHUTDOWN)
         {
             ec = std::make_error_code(std::errc::connection_reset);
             close();
@@ -340,10 +418,9 @@ size_t SocketConnection::recv(uint8_t* data, size_t size, std::error_code& ec)
         else
             ec = std::make_error_code(std::errc::io_error);
 #else
-        e = errno;
-        if (e == EAGAIN || e == EWOULDBLOCK)
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
             ec = std::make_error_code(std::errc::operation_would_block);
-        else if (e == ECONNRESET)
+        else if (errno == ECONNRESET)
         {
             ec = std::make_error_code(std::errc::connection_reset);
             close();
@@ -355,16 +432,17 @@ size_t SocketConnection::recv(uint8_t* data, size_t size, std::error_code& ec)
             ec = std::make_error_code(std::errc::io_error);
         return 0;
     }
-    if (recvd == 0)
-    {
+    if (bytes_received == 0)
+    {  // Connection closed gracefully by peer
         ec = std::make_error_code(std::errc::connection_aborted);
-        setError(ec, "peer close in recv");
+        setError(ec, "Connection closed by peer during recv (0 bytes received)");
+        // Do not call 'close()' here directly. The caller will see connection_aborted.
         return 0;
     }
-    return (size_t)recvd;
+    return static_cast<size_t>(bytes_received);
 }
 
-std::unique_ptr<SocketConnection> SocketConnection::accept(int timeoutMs, std::error_code& ec)
+std::unique_ptr<SocketConnection> SocketConnection::accept(std::error_code& ec)
 {
 #ifdef _WIN32
     setPlatformError(
@@ -384,7 +462,7 @@ std::unique_ptr<SocketConnection> SocketConnection::accept(int timeoutMs, std::e
     pfd.fd = socket_;
     pfd.events = POLLIN;
     pfd.revents = 0;
-    int r = poll(&pfd, 1, timeoutMs);
+    int r = poll(&pfd, 1, accept_timout_ms);
     if (r < 0)
     {
         setPlatformError("poll accept");
