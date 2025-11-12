@@ -14,115 +14,155 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#include <filesystem>
-#include <future>
-#include <iostream>
-#include <ostream>
-#include <string>
-#include <system_error>
-#include <thread>
-
-#include "absl/flags/flag.h"
-#include "absl/flags/internal/flag.h"
-#include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
-#include "absl/strings/str_format.h"
-#include "absl/strings/str_split.h"
-#include "android_application.h"
-#include "command_utils.h"
-#include "constants.h"
-#include "device_mgr.h"
-#include "network/tcp_client.h"
-#include "absl/strings/str_cat.h"
+#include "dive_client_cli.h"
 
 using namespace std::chrono_literals;
 
-enum class Command
+absl::Status ValidateRunOptions(const GlobalOptions& options)
 {
-    kNone,
-    kGfxrCapture,
-    kGfxrReplay,
-    kListDevice,
-    kListPackage,
-    kRunPackage,
-    kRunAndCapture,
-    kCleanup,
-};
+    if (options.package.empty() && options.vulkan_command.empty())
+    {
+        return absl::InvalidArgumentError("Missing required flag: --package or --vulkan_command");
+    }
+
+    static const std::set<std::string> valid_types = { "openxr", "vulkan", "vulkan_cli" };
+    if (valid_types.find(options.app_type) == valid_types.end())
+    {
+        return absl::InvalidArgumentError(
+        absl::StrCat("Invalid --type '",
+                     options.app_type,
+                     "'. Valid values: openxr, vulkan, vulkan_cli"));
+    }
+
+    if (!options.device_architecture.empty())
+    {
+        static const std::set<std::string> valid_archs = {
+            "arm64-v8a", "arm64-v8", "armeabi-v7a", "x86", "x86_64"
+        };
+
+        if (valid_archs.find(options.device_architecture) == valid_archs.end())
+        {
+            return absl::InvalidArgumentError(
+            absl::StrCat("Invalid --device_architecture '",
+                         options.device_architecture,
+                         "'. Valid values: arm64-v8a, arm64-v8, armeabi-v7a, x86, x86_64"));
+        }
+    }
+
+    return absl::OkStatus();
+}
+
+absl::Status ValidateGfxrReplayOptions(const GlobalOptions& options)
+{
+    if (options.replay_settings.remote_capture_path.empty())
+    {
+        return absl::InvalidArgumentError("Missing required flag: --gfxr_replay_file_path");
+    }
+    if (!absl::EndsWith(options.replay_settings.remote_capture_path, ".gfxr"))
+    {
+        return absl::InvalidArgumentError(absl::StrCat("Invalid --gfxr_replay_file_path '",
+                                                       options.replay_settings.remote_capture_path,
+                                                       "'. File must have a .gfxr extension."));
+    }
+    return absl::OkStatus();
+}
+
+const std::map<Command, CommandMetadata>& GetCommandRegistry()
+{
+    static const auto* registry = new std::map<Command, CommandMetadata>{
+        { Command::kListDevice,
+          { "list_device",
+            "List connected Android devices.",
+            [](const GlobalOptions&) { return absl::OkStatus(); },
+            CmdListDevice } },
+        { Command::kListPackage,
+          { "list_package",
+            "List installable packages on the selected device.",
+            [](const GlobalOptions&) { return absl::OkStatus(); },
+            CmdListPackage } },
+        { Command::kRunPackage,
+          { "run",
+            "Run an app for manual testing or external capture.",
+            ValidateRunOptions,
+            CmdRunPackage } },
+        { Command::kRunAndCapture,
+          { "capture",
+            "Run an app and trigger a capture after a delay.",
+            ValidateRunOptions,
+            CmdRunAndCapture } },
+        { Command::kGfxrCapture,
+          { "gfxr_capture",
+            "Run an app and enable GFXR capture via key-press.",
+            ValidateRunOptions,
+            CmdGfxrCapture } },
+        { Command::kGfxrReplay,
+          { "gfxr_replay",
+            "Deploy and run a GFXR replay.",
+            ValidateGfxrReplayOptions,
+            CmdGfxrReplay } },
+        { Command::kCleanup,
+          { "cleanup",
+            "Clean up app-specific settings on the device.",
+            [](const GlobalOptions& o) {
+                return o.package.empty() ? absl::InvalidArgumentError("Missing --package") :
+                                           absl::OkStatus();
+            },
+            CmdCleanup } },
+    };
+    return *registry;
+}
+
+std::string GenerateUsageString()
+{
+    std::string usage = "Available values for flag 'command':\n";
+    for (const auto& [cmd, meta] : GetCommandRegistry())
+    {
+        usage.append(absl::StrFormat("\t%-15s : %s\n", meta.name, meta.description));
+    }
+    return usage;
+}
+
+absl::Status WaitForExitConfirmation()
+{
+    std::cout << "Press any key+enter to exit" << std::endl;
+    std::string input;
+    if (std::getline(std::cin, input))
+    {
+        std::cout << "Exiting..." << std::endl;
+    }
+    return absl::OkStatus();
+}
 
 bool AbslParseFlag(absl::string_view text, Command* command, std::string* error)
 {
-    if (text == "list_device")
-    {
-        *command = Command::kListDevice;
-        return true;
-    }
-    if (text == "list_package")
-    {
-        *command = Command::kListPackage;
-        return true;
-    }
-    if (text == "run")
-    {
-        *command = Command::kRunPackage;
-        return true;
-    }
-    if (text == "capture")
-    {
-        *command = Command::kRunAndCapture;
-        return true;
-    }
-    if (text == "cleanup")
-    {
-        *command = Command::kCleanup;
-        return true;
-    }
-    if (text == "gfxr_capture")
-    {
-        *command = Command::kGfxrCapture;
-        return true;
-    }
-    if (text == "gfxr_replay")
-    {
-        *command = Command::kGfxrReplay;
-        return true;
-    }
     if (text.empty())
     {
         *command = Command::kNone;
         return true;
     }
-    *error = "unknown value for enumeration";
+    for (const auto& [cmd_enum, meta] : GetCommandRegistry())
+    {
+        if (text == meta.name)
+        {
+            *command = cmd_enum;
+            return true;
+        }
+    }
+    *error = absl::StrCat("\n" + GenerateUsageString());
     return false;
 }
 
 std::string AbslUnparseFlag(Command command)
 {
-    switch (command)
+    if (command == Command::kNone)
     {
-    case Command::kNone:
         return "";
-    case Command::kListDevice:
-        return "list_device";
-    case Command::kGfxrCapture:
-        return "gfxr_capture";
-    case Command::kGfxrReplay:
-        return "gfxr_replay";
-    case Command::kListPackage:
-        return "list_package";
-    case Command::kRunPackage:
-        return "run";
-    case Command::kRunAndCapture:
-        return "capture";
-    case Command::kCleanup:
-        return "cleanup";
-
-    default:
-        return absl::StrCat(command);
     }
+    auto& reg = GetCommandRegistry();
+    auto  it = reg.find(command);
+    return (it != reg.end()) ? it->second.name : "unknown";
 }
 
-// Abseil flags parsing uses ADL. GfxrReplayOptions is in the Dive namespace so AbslParseFlag
-// and AbslUnparseFlag need to be as well.
 namespace Dive
 {
 
@@ -241,184 +281,167 @@ ABSL_FLAG(Dive::GfxrReplayOptions,
           "Create a RenderDoc capture");
 ABSL_FLAG(bool, validation_layer, false, "Run GFXR replay with the Vulkan Validation Layer");
 
-void PrintUsage()
-{
-    std::cout << absl::ProgramUsageMessage() << std::endl;
-}
-
-bool ListDevice(const Dive::DeviceManager& mgr)
+absl::StatusOr<Dive::AndroidDevice*> GetTargetDevice(Dive::DeviceManager& mgr,
+                                                     const std::string&   serial_flag)
 {
     auto list = mgr.ListDevice();
     if (list.empty())
     {
-        std::cout << "No device connected" << std::endl;
-        return false;
-    }
-    int index = 0;
-    std::cout << "Devices: " << std::endl;
-    for (const auto& device : list)
-    {
-        std::cout << ++index << " : " << device.GetDisplayName() << std::endl;
+        return absl::UnavailableError("No Android devices connected.");
     }
 
-    return true;
-}
-
-bool ListPackage(Dive::DeviceManager& mgr, const std::string& device_serial)
-{
-    auto dev_ret = mgr.SelectDevice(device_serial);
-    if (!dev_ret.ok())
+    std::string target_serial = serial_flag;
+    if (target_serial.empty())
     {
-        std::cout << "Failed to select device: " << dev_ret.status().message() << std::endl;
-        return false;
-    }
-    auto device = *dev_ret;
-    auto ret = device->SetupDevice();
-    if (!ret.ok())
-    {
-        std::cout << "Failed to setup device, error: " << ret.message() << std::endl;
-        return false;
-    }
-
-    auto result = device->ListPackage();
-    if (!result.ok())
-    {
-        std::cout << "Failed to list packages, error: " << ret.message() << std::endl;
-        return false;
-    }
-    std::vector<std::string> packages = *result;
-    int                      index = 0;
-    std::cout << "Packages: " << std::endl;
-    for (const auto& package : packages)
-    {
-        std::cout << ++index << " : " << package << std::endl;
-    }
-
-    return true;
-}
-
-bool RunPackage(Dive::DeviceManager& mgr,
-                const std::string&   serial,
-                const std::string&   app_type,
-                const std::string&   package,
-                const std::string&   command,
-                const std::string&   command_args,
-                const std::string&   device_architecture,
-                const std::string&   gfxr_capture_directory,
-                bool                 is_gfxr_capture)
-{
-    if (serial.empty() || (package.empty() && command.empty()))
-    {
-        std::cout << "Missing required options." << std::endl;
-        PrintUsage();
-        return false;
-    }
-    auto dev_ret = mgr.SelectDevice(serial);
-
-    if (!dev_ret.ok())
-    {
-        std::cout << "Failed to select device " << dev_ret.status().message() << std::endl;
-        return false;
-    }
-    auto dev = *dev_ret;
-    dev->EnableGfxr(is_gfxr_capture);
-    auto ret = dev->SetupDevice();
-    if (!ret.ok())
-    {
-        std::cout << "Failed to setup device, error: " << ret.message() << std::endl;
-        return false;
-    }
-
-    if (app_type == "openxr")
-    {
-        ret = dev->SetupApp(package,
-                            Dive::ApplicationType::OPENXR_APK,
-                            command_args,
-                            device_architecture,
-                            gfxr_capture_directory);
-    }
-    else if (app_type == "vulkan")
-    {
-        ret = dev->SetupApp(package,
-                            Dive::ApplicationType::VULKAN_APK,
-                            command_args,
-                            device_architecture,
-                            gfxr_capture_directory);
-    }
-    else if (app_type == "vulkan_cli")
-    {
-        ret = dev->SetupApp(command,
-                            command_args,
-                            Dive::ApplicationType::VULKAN_CLI,
-                            device_architecture,
-                            gfxr_capture_directory);
+        if (list.size() == 1)
+        {
+            target_serial = list.front().m_serial;
+            std::cout << "Using single connected device: " << target_serial << std::endl;
+        }
+        else
+        {
+            std::string
+            msg = "Multiple devices connected. Specify --device [serial].\nAvailables:\n";
+            for (const auto& d : list)
+            {
+                msg.append("\t" + d.GetDisplayName() + "\n");
+            }
+            return absl::InvalidArgumentError(msg);
+        }
     }
     else
     {
-        PrintUsage();
-        return false;
-    }
-    if (!ret.ok())
-    {
-        std::cout << "Failed to setup app, error: " << ret.message() << std::endl;
-        return false;
+        bool        found = false;
+        std::string msg;
+        for (const auto& d : list)
+        {
+            if (d.m_serial == target_serial)
+            {
+                found = true;
+                break;
+            }
+            msg.append("\t" + d.GetDisplayName() + "\n");
+        }
+        if (!found)
+        {
+            return absl::InvalidArgumentError("Device with serial '" + target_serial +
+                                              "' not found.\n" + "Available devices:\n" + msg);
+        }
     }
 
-    ret = dev->StartApp();
-    if (!ret.ok())
+    auto device = mgr.SelectDevice(target_serial);
+    if (!device.ok())
     {
-        std::cout << "Failed to start app, error: " << ret.message() << std::endl;
+        return device.status();
     }
 
-    return ret.ok();
+    auto ret = (*device)->SetupDevice();
+    if (!ret.ok())
+    {
+        return absl::InternalError("Failed to setup device: " + std::string(ret.message()));
+    }
+    return *device;
 }
 
-bool TriggerCapture(Dive::DeviceManager& mgr)
+absl::Status InternalRunPackage(const CommandContext& ctx, bool enable_gfxr)
+{
+    auto* device = ctx.mgr.GetDevice();
+    if (device == nullptr)
+    {
+        return absl::FailedPreconditionError(
+        "No device selected. Did you provide --device serial?");
+    }
+    device->EnableGfxr(enable_gfxr);
+
+    absl::Status ret;
+    if (ctx.options.app_type == "openxr")
+    {
+        ret = device->SetupApp(ctx.options.package,
+                               Dive::ApplicationType::OPENXR_APK,
+                               ctx.options.vulkan_command_args,
+                               ctx.options.device_architecture,
+                               ctx.options.gfxr_capture_file_dir);
+    }
+    else if (ctx.options.app_type == "vulkan")
+    {
+        ret = device->SetupApp(ctx.options.package,
+                               Dive::ApplicationType::VULKAN_APK,
+                               ctx.options.vulkan_command_args,
+                               ctx.options.device_architecture,
+                               ctx.options.gfxr_capture_file_dir);
+    }
+    else if (ctx.options.app_type == "vulkan_cli")
+    {
+        ret = device->SetupApp(ctx.options.vulkan_command,
+                               ctx.options.vulkan_command_args,
+                               Dive::ApplicationType::VULKAN_CLI,
+                               ctx.options.device_architecture,
+                               ctx.options.gfxr_capture_file_dir);
+    }
+    else
+    {
+        return absl::InvalidArgumentError("Unknown app type: " + ctx.options.app_type);
+    }
+
+    if (!ret.ok())
+    {
+        return absl::InternalError("Setup failed: " + std::string(ret.message()));
+    }
+
+    ret = device->StartApp();
+    if (!ret.ok())
+    {
+        return absl::InternalError("Start app failed: " + std::string(ret.message()));
+    }
+    return absl::OkStatus();
+}
+
+absl::Status TriggerCapture(Dive::DeviceManager& mgr)
 {
     if (mgr.GetDevice() == nullptr)
     {
-        std::cout << "No device selected, can't capture. Did you provide --device serial?"
-                  << std::endl;
-        return false;
+        return absl::FailedPreconditionError("No device selected, can't capture.");
     }
 
     std::string        download_dir = absl::GetFlag(FLAGS_download_dir);
     Network::TcpClient client;
     const std::string  host = "127.0.0.1";
     int                port = mgr.GetDevice()->Port();
-    absl::Status       status = client.Connect(host, port);
+
+    absl::Status status = client.Connect(host, port);
     if (!status.ok())
     {
-        std::cout << "Connection failed: " << status.message() << std::endl;
-        return false;
+        return absl::UnavailableError("Connection failed: " + std::string(status.message()));
     }
+
     absl::StatusOr<std::string> capture_file_path = client.StartPm4Capture();
     if (!capture_file_path.ok())
     {
-        std::cout << capture_file_path.status().message() << std::endl;
-        return false;
+        return capture_file_path.status();
     }
 
     std::filesystem::path target_download_dir(download_dir);
     if (!std::filesystem::is_directory(target_download_dir))
     {
-        std::cout << "Invalid download directory: " << target_download_dir << std::endl;
-        return false;
+        return absl::InvalidArgumentError("Invalid download directory: " +
+                                          target_download_dir.string());
     }
+
     std::filesystem::path p(*capture_file_path);
     std::string           download_file_path = (target_download_dir / p.filename()).string();
+
     status = client.DownloadFileFromServer(*capture_file_path, download_file_path);
     if (!status.ok())
     {
-        std::cout << status.message() << std::endl;
-        return false;
+        return status;
     }
+
     std::cout << "Capture saved at " << download_file_path << std::endl;
-    return true;
+    return absl::OkStatus();
 }
 
-absl::Status IsCaptureDirectoryBusy(Dive::DeviceManager& mgr,
-                                    const std::string&   gfxr_capture_directory)
+absl::Status CheckCaptureFinished(Dive::DeviceManager& mgr,
+                                  const std::string&   gfxr_capture_directory)
 {
     std::string                 on_device_capture_directory = absl::StrCat(Dive::kDeviceCapturePath,
                                                            "/",
@@ -483,7 +506,7 @@ absl::Status RenameScreenshotFile(const std::filesystem::path& full_target_downl
     return absl::OkStatus();
 }
 
-const std::filesystem::path GetGfxrCaptureFileName(
+absl::StatusOr<std::filesystem::path> GetGfxrCaptureFileName(
 const std::filesystem::path&    full_target_download_dir,
 const std::vector<std::string>& file_list)
 {
@@ -495,10 +518,11 @@ const std::vector<std::string>& file_list)
             return full_target_download_dir / trimmed_filename;
         }
     }
-    return std::filesystem::path();
+    return absl::NotFoundError("No file with '.gfxr' extension found in the list.");
 }
 
-bool RetrieveGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_capture_directory)
+absl::Status RetrieveGfxrCapture(Dive::DeviceManager& mgr,
+                                 const std::string&   gfxr_capture_directory)
 {
     std::filesystem::path download_dir = absl::GetFlag(FLAGS_download_dir);
 
@@ -514,20 +538,18 @@ bool RetrieveGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_captu
     absl::StatusOr<std::string> output = mgr.GetDevice()->Adb().RunAndGetResult(command);
     if (!output.ok())
     {
-        std::cout << "Error getting capture_file name: " << output.status().message() << std::endl;
-        return false;
+        return absl::InternalError("Error getting capture_file name: " +
+                                   std::string(output.status().message()));
     }
 
     std::vector<std::string> file_list = absl::StrSplit(std::string(output->data()),
                                                         '\n',
                                                         absl::SkipEmpty());
 
-    // Check if on-device directory is empty
     if (file_list.empty())
     {
-        std::cout << "Error, captures not present on device at: " << on_device_capture_directory
-                  << std::endl;
-        return false;
+        return absl::NotFoundError("Error, captures not present on device at: " +
+                                   on_device_capture_directory);
     }
 
     // Find name for new local target directory
@@ -550,33 +572,31 @@ bool RetrieveGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_captu
     output = mgr.GetDevice()->Adb().RunAndGetResult(command);
     if (!output.ok())
     {
-        std::cout << "Error pulling files: " << output.status().message() << std::endl;
-        return false;
+        return absl::InternalError("Error pulling files: " +
+                                   std::string(output.status().message()));
     }
 
-    const std::filesystem::path gfxr_capture_file = GetGfxrCaptureFileName(full_target_download_dir,
-                                                                           file_list);
+    auto gfxr_capture_file = GetGfxrCaptureFileName(full_target_download_dir, file_list);
 
-    if (gfxr_capture_file.empty())
+    if (!gfxr_capture_file.ok())
     {
-        std::cout << "Error: No file with '.gfxr' extension found in the list." << std::endl;
-        return false;
+        return gfxr_capture_file.status();
     }
 
-    if (absl::Status ret = RenameScreenshotFile(full_target_download_dir, gfxr_capture_file);
+    if (absl::Status ret = RenameScreenshotFile(full_target_download_dir, *gfxr_capture_file);
         !ret.ok())
     {
-        std::cout << "Error renaming screenshot: " << ret.message() << std::endl;
+        std::cout << "Warning: Error renaming screenshot: " << ret.message() << std::endl;
     }
 
     std::cout << "Capture sucessfully saved at " << full_target_download_dir << std::endl;
-    return true;
+    return absl::OkStatus();
 }
 
-void TriggerGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_capture_directory)
+absl::Status TriggerGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_capture_directory)
 {
     std::cout
-    << "Press key g+enter to trigger a capture and g+enter to retrieve the capture. Press "
+    << "Press key g+enter to trigger a capture and g+enter again to retrieve the capture. Press "
        "any other key+enter to stop the application. Note that this may impact your "
        "capture file if the capture has not been completed. \n";
     std::string
@@ -592,82 +612,65 @@ void TriggerGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_captur
         {
             if (is_capturing)
             {
-                ret = IsCaptureDirectoryBusy(mgr, gfxr_capture_directory);
-                while (!ret.ok())
+                while (!CheckCaptureFinished(mgr, gfxr_capture_directory).ok())
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     std::cout << "GFXR capture in progress, please wait for current capture to "
                                  "complete before starting another."
                               << std::endl;
                 }
+
                 ret = mgr.GetDevice()->Adb().Run(
                 "shell setprop debug.gfxrecon.capture_android_trigger false");
                 if (!ret.ok())
                 {
-                    std::cout << "There was an error stopping the gfxr runtime capture."
-                              << std::endl;
-                    return;
+                    return absl::InternalError("Error stopping gfxr runtime capture: " +
+                                               std::string(ret.message()));
                 }
 
-                // Retrieve the capture and asset file at the end of the capture.
-                RetrieveGfxrCapture(mgr, gfxr_capture_directory);
+                // Retrieve the capture. If this fails, we print an error but don't exit the tool,
+                // allowing the user to try again.
+                absl::Status retrieve_status = RetrieveGfxrCapture(mgr, gfxr_capture_directory);
+                if (!retrieve_status.ok())
+                {
+                    std::cout << "Failed to retrieve capture: " << retrieve_status.message()
+                              << std::endl;
+                }
+                else
+                {
+                    std::cout << capture_complete_message << std::endl;
+                }
                 is_capturing = false;
-                std::cout << capture_complete_message << std::endl;
             }
             else
             {
                 ret = mgr.GetDevice()->Adb().Run(
                 "shell setprop debug.gfxrecon.capture_android_trigger true");
-
                 if (!ret.ok())
                 {
-                    std::cout << "There was an error starting the gfxr runtime capture."
-                              << std::endl;
-                    return;
+                    return absl::InternalError("Error starting gfxr runtime capture: " +
+                                               std::string(ret.message()));
                 }
 
                 std::filesystem::path gfxr_capture_directory_path(gfxr_capture_directory);
                 ret = mgr.GetDevice()->TriggerScreenCapture(gfxr_capture_directory_path);
-
                 if (!ret.ok())
                 {
-                    std::cout << "Failed to create capture screenshot: " +
-                                 std::string(ret.message())
-                              << std::endl;
-                    return;
+                    return absl::InternalError("Error creating capture screenshot: " +
+                                               std::string(ret.message()));
                 }
 
                 is_capturing = true;
-                std::cout << "Capture started. Press g+enter to retrieve the capture." << std::endl;
+                std::cout << "Capture started. Press key g+enter to retrieve the capture."
+                          << std::endl;
             }
         }
         else
         {
             if (is_capturing)
             {
-                std::string warning_message = "GFXR capture in progress, please wait for capture "
-                                              "to complete before stopping the application.";
-
-                std::cout << warning_message << std::endl;
-                ret = IsCaptureDirectoryBusy(mgr, gfxr_capture_directory);
-                while (!ret.ok())
-                {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    std::cout << warning_message << std::endl;
-                }
-                ret = mgr.GetDevice()->Adb().Run(
-                "shell setprop debug.gfxrecon.capture_android_trigger false");
-                if (!ret.ok())
-                {
-                    std::cout << "There was an error stopping the gfxr runtime capture."
-                              << std::endl;
-                    return;
-                }
-
-                // Retrieve the capture and asset file at the end of the capture.
-                RetrieveGfxrCapture(mgr, gfxr_capture_directory);
-                is_capturing = false;
-                std::cout << capture_complete_message << std::endl;
+                std::cout << "GFXR capture in progress, press key g+enter to retrieve the capture."
+                          << std::endl;
             }
             else
             {
@@ -683,263 +686,161 @@ void TriggerGfxrCapture(Dive::DeviceManager& mgr, const std::string& gfxr_captur
                                                            gfxr_capture_directory);
     ret = mgr.GetDevice()->Adb().Run(
     absl::StrFormat("shell rm -rf %s", on_device_capture_directory));
+
+    return absl::OkStatus();
 }
 
-bool RunAndCapture(Dive::DeviceManager& mgr,
-                   const std::string&   serial,
-                   const std::string&   app_type,
-                   const std::string&   package,
-                   const std::string&   command,
-                   const std::string&   command_args,
-                   const std::string&   device_architecture,
-                   const std::string&   gfxr_capture_directory,
-                   const bool           is_gfxr_capture)
+absl::Status CmdListDevice(const CommandContext& ctx)
 {
-    if (!RunPackage(mgr,
-                    serial,
-                    app_type,
-                    package,
-                    command,
-                    command_args,
-                    device_architecture,
-                    gfxr_capture_directory,
-                    is_gfxr_capture))
+    auto list = ctx.mgr.ListDevice();
+    if (list.empty())
     {
-        return false;
+        std::cout << "No device connected." << std::endl;
+        return absl::OkStatus();
     }
-
-    if (is_gfxr_capture)
+    std::cout << "Devices: " << std::endl;
+    for (const auto& device : list)
     {
-        TriggerGfxrCapture(mgr, gfxr_capture_directory);
+        std::cout << "\t" << device.GetDisplayName() << std::endl;
     }
-    else
-    {
-        int time_to_wait_in_seconds = absl::GetFlag(FLAGS_trigger_capture_after);
-        std::cout << "wait for " << time_to_wait_in_seconds << " seconds" << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(time_to_wait_in_seconds));
-
-        TriggerCapture(mgr);
-
-        std::cout << "Press other key+enter to exit" << std::endl;
-        std::string input;
-        if (std::getline(std::cin, input))
-        {
-            std::cout << "Exiting..." << std::endl;
-        }
-    }
-
-    return true;
+    return absl::OkStatus();
 }
 
-bool CleanUpAppAndDevice(Dive::DeviceManager& mgr,
-                         const std::string&   serial,
-                         const std::string&   package)
+absl::Status CmdListPackage(const CommandContext& ctx)
 {
-    if (serial.empty())
-    {
-        std::cout << "Please run with `--device [serial]` and `--package [package]` options."
-                  << std::endl;
-        PrintUsage();
-        return false;
-    }
-
-    if (mgr.GetDevice() == nullptr)
-    {
-        if (absl::StatusOr<Dive::AndroidDevice*> device = mgr.SelectDevice(serial); !device.ok())
-        {
-            std::cout << "Failed to select device: " << device.status() << std::endl;
-            return false;
-        }
-    }
-
-    if (package.empty())
-    {
-        std::cout << "Package not provided. You run run with `--package [package]` options to "
-                     "clean up package specific settings.";
-        return true;
-    }
-
-    return mgr.CleanupPackageProperties(package).ok();
-}
-
-bool ProcessInput(Dive::DeviceManager& mgr)
-{
-    std::cout << "Press key t+enter to trigger a capture. \nPress any other key+enter to exit.";
-
-    std::string input;
-    while (std::getline(std::cin, input))
-    {
-        if (input == "t")
-        {
-            std::cout << "key t pressed " << std::endl;
-            TriggerCapture(mgr);
-        }
-        else
-        {
-            break;
-        }
-        std::cout << "Press key t+enter to trigger a capture. \nPress other key+enter to exit.";
-    }
-
-    return true;
-}
-
-bool DeployGfxrReplay(Dive::DeviceManager& mgr, const std::string& device_serial)
-{
-    auto dev_ret = mgr.SelectDevice(device_serial);
-
-    if (!dev_ret.ok())
-    {
-        std::cout << "Failed to select device " << dev_ret.status().message() << std::endl;
-        return false;
-    }
-
-    auto dev = *dev_ret;
-    auto ret = dev->SetupDevice();
+    auto* device = ctx.mgr.GetDevice();
+    auto  ret = device->ListPackage();
     if (!ret.ok())
     {
-        std::cout << "Failed to setup device, error: " << ret.message() << std::endl;
-        return false;
+        return ret.status();
     }
-    // Deploying install/gfxr-replay.apk
-    ret = mgr.DeployReplayApk(device_serial);
-    if (!ret.ok())
+    std::cout << "Packages: " << std::endl;
+    for (const auto& pkg : *ret)
     {
-        return false;
+        std::cout << "\t" << pkg << std::endl;
     }
-
-    return true;
+    return absl::OkStatus();
 }
 
-bool DeployAndRunGfxrReplay(Dive::DeviceManager&            mgr,
-                            const std::string&              device_serial,
-                            const Dive::GfxrReplaySettings& replay_settings)
+absl::Status CmdRunPackage(const CommandContext& ctx)
 {
-    if (!DeployGfxrReplay(mgr, device_serial))
+    absl::Status status = InternalRunPackage(ctx, false);
+    if (!status.ok())
     {
-        return false;
+        return status;
+    }
+    return WaitForExitConfirmation();
+}
+
+absl::Status CmdRunAndCapture(const CommandContext& ctx)
+{
+    absl::Status status = InternalRunPackage(ctx, false);
+    if (!status.ok())
+    {
+        return status;
     }
 
-    auto ret = mgr.RunReplayApk(replay_settings);
-    if (!ret.ok())
+    std::cout << "Waiting " << ctx.options.trigger_capture_after << " seconds...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(ctx.options.trigger_capture_after));
+
+    status = TriggerCapture(ctx.mgr);
+    if (!status.ok())
     {
-        std::cout << "Failed to DeployAndRunGfxrReplay, error: " << ret.message() << std::endl;
+        return status;
     }
-    return ret.ok();
+    return WaitForExitConfirmation();
+}
+
+absl::Status CmdGfxrCapture(const CommandContext& ctx)
+{
+    absl::Status status = InternalRunPackage(ctx, true);
+    if (!status.ok())
+    {
+        return status;
+    }
+    return TriggerGfxrCapture(ctx.mgr, ctx.options.gfxr_capture_file_dir);
+}
+
+absl::Status CmdGfxrReplay(const CommandContext& ctx)
+{
+    absl::Status status = ctx.mgr.DeployReplayApk(ctx.options.serial);
+    if (!status.ok())
+    {
+        return absl::InternalError("Failed to deploy replay apk: " + std::string(status.message()));
+    }
+
+    status = ctx.mgr.RunReplayApk(ctx.options.replay_settings);
+    if (!status.ok())
+    {
+        return absl::InternalError("Failed to run replay apk: " + std::string(status.message()));
+    }
+    return absl::OkStatus();
+}
+
+absl::Status CmdCleanup(const CommandContext& ctx)
+{
+    return ctx.mgr.CleanupPackageProperties(ctx.options.package);
 }
 
 int main(int argc, char** argv)
 {
-    absl::SetProgramUsageMessage("Run app with --help for more details");
+    absl::SetProgramUsageMessage("Dive Tool CLI. Use --help for details.");
     absl::ParseCommandLine(argc, argv);
-    Command     cmd = absl::GetFlag(FLAGS_command);
-    std::string serial = absl::GetFlag(FLAGS_device);
-    std::string package = absl::GetFlag(FLAGS_package);
-    std::string vulkan_command = absl::GetFlag(FLAGS_vulkan_command);
-    std::string vulkan_command_args = absl::GetFlag(FLAGS_vulkan_command_args);
-    std::string app_type = absl::GetFlag(FLAGS_type);
-    std::string device_architecture = absl::GetFlag(FLAGS_device_architecture);
-    std::string gfxr_capture_file_dir = absl::GetFlag(FLAGS_gfxr_capture_file_dir);
 
-    Dive::GfxrReplaySettings replay_settings;
-    replay_settings.remote_capture_path = absl::GetFlag(FLAGS_gfxr_replay_file_path);
-    replay_settings.local_download_dir = absl::GetFlag(FLAGS_download_dir);
-    replay_settings.use_validation_layer = absl::GetFlag(FLAGS_validation_layer);
-    replay_settings.run_type = absl::GetFlag(FLAGS_gfxr_replay_run_type);
-    replay_settings.replay_flags_str = absl::GetFlag(FLAGS_gfxr_replay_flags);
-    replay_settings.metrics = absl::GetFlag(FLAGS_metrics);
-    // loop_single_frame_count is parsed from --gfxr_replay_flags
+    GlobalOptions opts;
+    opts.serial = absl::GetFlag(FLAGS_device);
+    opts.package = absl::GetFlag(FLAGS_package);
+    opts.vulkan_command = absl::GetFlag(FLAGS_vulkan_command);
+    opts.vulkan_command_args = absl::GetFlag(FLAGS_vulkan_command_args);
+    opts.app_type = absl::GetFlag(FLAGS_type);
+    opts.device_architecture = absl::GetFlag(FLAGS_device_architecture);
+    opts.download_dir = absl::GetFlag(FLAGS_download_dir);
+    opts.gfxr_capture_file_dir = absl::GetFlag(FLAGS_gfxr_capture_file_dir);
+    opts.trigger_capture_after = absl::GetFlag(FLAGS_trigger_capture_after);
+
+    opts.replay_settings.remote_capture_path = absl::GetFlag(FLAGS_gfxr_replay_file_path);
+    opts.replay_settings.local_download_dir = absl::GetFlag(FLAGS_download_dir);
+    opts.replay_settings.use_validation_layer = absl::GetFlag(FLAGS_validation_layer);
+    opts.replay_settings.run_type = absl::GetFlag(FLAGS_gfxr_replay_run_type);
+    opts.replay_settings.replay_flags_str = absl::GetFlag(FLAGS_gfxr_replay_flags);
+    opts.replay_settings.metrics = absl::GetFlag(FLAGS_metrics);
+
+    Command     cmd = absl::GetFlag(FLAGS_command);
+    const auto& registry = GetCommandRegistry();
+    auto        it = registry.find(cmd);
+    if (cmd == Command::kNone || it == registry.end())
+    {
+        std::cout << "Error: No valid command specified.\n" << GenerateUsageString() << std::endl;
+        return 1;
+    }
+
+    const auto& command_meta = it->second;
+    auto        ret = command_meta.validator(opts);
+    if (!ret.ok())
+    {
+        std::cout << "Validation error for command '" << command_meta.name << "': " << ret.message()
+                  << std::endl;
+        return 1;
+    }
 
     Dive::DeviceManager mgr;
-    auto                list = mgr.ListDevice();
-    if (list.empty())
+    if (cmd != Command::kListDevice)
     {
-        std::cout << "No device connected" << std::endl;
-        return 0;
-    }
-
-    if (serial.empty() && list.size() == 1)
-    {
-        serial = list.front().m_serial;
-        std::cout << "--device unspecified, using " << serial << '\n';
-    }
-
-    bool res = false;
-
-    switch (cmd)
-    {
-    case Command::kGfxrCapture:
-    {
-        RunAndCapture(mgr,
-                      serial,
-                      app_type,
-                      package,
-                      vulkan_command,
-                      vulkan_command_args,
-                      device_architecture,
-                      gfxr_capture_file_dir,
-                      true);
-        break;
-    }
-    case Command::kGfxrReplay:
-    {
-        res = DeployAndRunGfxrReplay(mgr, serial, replay_settings);
-        break;
-    }
-    case Command::kListDevice:
-    {
-        res = ListDevice(mgr);
-        break;
-    }
-    case Command::kListPackage:
-    {
-        res = ListPackage(mgr, serial);
-        break;
-    }
-
-    case Command::kRunPackage:
-    {
-        if (RunPackage(mgr,
-                       serial,
-                       app_type,
-                       package,
-                       vulkan_command,
-                       vulkan_command_args,
-                       "",
-                       "",
-                       false))
+        auto device = GetTargetDevice(mgr, opts.serial);
+        if (!device.ok())
         {
-            res = ProcessInput(mgr);
+            std::cout << device.status().message() << std::endl;
+            return 1;
         }
-
-        break;
     }
 
-    case Command::kRunAndCapture:
+    CommandContext ctx{ mgr, opts };
+    ret = command_meta.executor(ctx);
+    if (!ret.ok())
     {
-        res = RunAndCapture(mgr,
-                            serial,
-                            app_type,
-                            package,
-                            vulkan_command,
-                            vulkan_command_args,
-                            "",
-                            "",
-                            false);
-        break;
+        std::cout << "Error executing command '" << command_meta.name << "': " << ret.message()
+                  << std::endl;
+        return 1;
     }
-    case Command::kCleanup:
-    {
-        res = CleanUpAppAndDevice(mgr, serial, package);
-        break;
-    }
-    case Command::kNone:
-    {
-        PrintUsage();
-        res = true;
-        break;
-    }
-    }
-
-    return res ? 0 : 1;
+    return 0;
 }
