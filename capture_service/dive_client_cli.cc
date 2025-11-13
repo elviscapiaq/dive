@@ -16,6 +16,28 @@ limitations under the License.
 
 #include "dive_client_cli.h"
 
+#include <filesystem>
+#include <future>
+#include <iostream>
+#include <ostream>
+#include <string>
+#include <system_error>
+#include <thread>
+
+#include "absl/flags/flag.h"
+#include "absl/flags/internal/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+
+#include "android_application.h"
+#include "command_utils.h"
+#include "constants.h"
+#include "device_mgr.h"
+#include "network/tcp_client.h"
+
 using namespace std::chrono_literals;
 
 absl::Status ValidateRunOptions(const GlobalOptions& options)
@@ -70,44 +92,73 @@ absl::Status ValidateGfxrReplayOptions(const GlobalOptions& options)
 const std::map<Command, CommandMetadata>& GetCommandRegistry()
 {
     static const auto* registry = new std::map<Command, CommandMetadata>{
-        { Command::kListDevice,
-          { "list_device",
-            "List connected Android devices.",
-            [](const GlobalOptions&) { return absl::OkStatus(); },
-            CmdListDevice } },
-        { Command::kListPackage,
-          { "list_package",
-            "List installable packages on the selected device.",
-            [](const GlobalOptions&) { return absl::OkStatus(); },
-            CmdListPackage } },
-        { Command::kRunPackage,
-          { "run",
-            "Run an app for manual testing or external capture.",
-            ValidateRunOptions,
-            CmdRunPackage } },
-        { Command::kRunAndCapture,
-          { "capture",
-            "Run an app and trigger a capture after a delay.",
-            ValidateRunOptions,
-            CmdRunAndCapture } },
-        { Command::kGfxrCapture,
-          { "gfxr_capture",
-            "Run an app and enable GFXR capture via key-press.",
-            ValidateRunOptions,
-            CmdGfxrCapture } },
-        { Command::kGfxrReplay,
-          { "gfxr_replay",
-            "Deploy and run a GFXR replay.",
-            ValidateGfxrReplayOptions,
-            CmdGfxrReplay } },
-        { Command::kCleanup,
-          { "cleanup",
-            "Clean up app-specific settings on the device.",
-            [](const GlobalOptions& o) {
-                return o.package.empty() ? absl::InvalidArgumentError("Missing --package") :
-                                           absl::OkStatus();
-            },
-            CmdCleanup } },
+        {
+        Command::kListDevice,
+        {
+        .name = "list_device",
+        .description = "List connected Android devices.",
+        .validator = [](const GlobalOptions&) { return absl::OkStatus(); },
+        .executor = CmdListDevice,
+        },
+        },
+        {
+        Command::kListPackage,
+        {
+        .name = "list_package",
+        .description = "List installable packages on the selected device.",
+        .validator = [](const GlobalOptions&) { return absl::OkStatus(); },
+        .executor = CmdListPackage,
+        },
+        },
+        {
+        Command::kRunPackage,
+        {
+        .name = "run",
+        .description = "Run an app for manual testing or external capture.",
+        .validator = ValidateRunOptions,
+        .executor = CmdRunPackage,
+        },
+        },
+        {
+        Command::kRunAndCapture,
+        {
+        .name = "capture",
+        .description = "Run an app and trigger a capture after a delay.",
+        .validator = ValidateRunOptions,
+        .executor = CmdRunAndCapture,
+        },
+        },
+        {
+        Command::kGfxrCapture,
+        {
+        .name = "gfxr_capture",
+        .description = "Run an app and enable GFXR capture via key-press.",
+        .validator = ValidateRunOptions,
+        .executor = CmdGfxrCapture,
+        },
+        },
+        {
+        Command::kGfxrReplay,
+        {
+        .name = "gfxr_replay",
+        .description = "Deploy and run a GFXR replay.",
+        .validator = ValidateGfxrReplayOptions,
+        .executor = CmdGfxrReplay,
+        },
+        },
+        {
+        Command::kCleanup,
+        {
+        .name = "cleanup",
+        .description = "Clean up app-specific settings on the device.",
+        .validator =
+        [](const GlobalOptions& o) {
+            return o.package.empty() ? absl::InvalidArgumentError("Missing --package") :
+                                       absl::OkStatus();
+        },
+        .executor = CmdCleanup,
+        },
+        },
     };
     return *registry;
 }
@@ -787,23 +838,24 @@ int main(int argc, char** argv)
     absl::SetProgramUsageMessage("Dive Tool CLI. Use --help for details.");
     absl::ParseCommandLine(argc, argv);
 
-    GlobalOptions opts;
-    opts.serial = absl::GetFlag(FLAGS_device);
-    opts.package = absl::GetFlag(FLAGS_package);
-    opts.vulkan_command = absl::GetFlag(FLAGS_vulkan_command);
-    opts.vulkan_command_args = absl::GetFlag(FLAGS_vulkan_command_args);
-    opts.app_type = absl::GetFlag(FLAGS_type);
-    opts.device_architecture = absl::GetFlag(FLAGS_device_architecture);
-    opts.download_dir = absl::GetFlag(FLAGS_download_dir);
-    opts.gfxr_capture_file_dir = absl::GetFlag(FLAGS_gfxr_capture_file_dir);
-    opts.trigger_capture_after = absl::GetFlag(FLAGS_trigger_capture_after);
-
-    opts.replay_settings.remote_capture_path = absl::GetFlag(FLAGS_gfxr_replay_file_path);
-    opts.replay_settings.local_download_dir = absl::GetFlag(FLAGS_download_dir);
-    opts.replay_settings.use_validation_layer = absl::GetFlag(FLAGS_validation_layer);
-    opts.replay_settings.run_type = absl::GetFlag(FLAGS_gfxr_replay_run_type);
-    opts.replay_settings.replay_flags_str = absl::GetFlag(FLAGS_gfxr_replay_flags);
-    opts.replay_settings.metrics = absl::GetFlag(FLAGS_metrics);
+    GlobalOptions opts{ .serial = absl::GetFlag(FLAGS_device),
+                        .package = absl::GetFlag(FLAGS_package),
+                        .vulkan_command = absl::GetFlag(FLAGS_vulkan_command),
+                        .vulkan_command_args = absl::GetFlag(FLAGS_vulkan_command_args),
+                        .app_type = absl::GetFlag(FLAGS_type),
+                        .device_architecture = absl::GetFlag(FLAGS_device_architecture),
+                        .download_dir = absl::GetFlag(FLAGS_download_dir),
+                        .gfxr_capture_file_dir = absl::GetFlag(FLAGS_gfxr_capture_file_dir),
+                        .trigger_capture_after = absl::GetFlag(FLAGS_trigger_capture_after),
+                        .replay_settings = {
+                            .remote_capture_path = absl::GetFlag(FLAGS_gfxr_replay_file_path),
+                            .local_download_dir = absl::GetFlag(FLAGS_download_dir),
+                            .run_type = absl::GetFlag(FLAGS_gfxr_replay_run_type),
+                            .replay_flags_str = absl::GetFlag(FLAGS_gfxr_replay_flags),
+                            .metrics = absl::GetFlag(FLAGS_metrics),
+                            .use_validation_layer = absl::GetFlag(FLAGS_validation_layer),
+                         },
+                     };
 
     Command     cmd = absl::GetFlag(FLAGS_command);
     const auto& registry = GetCommandRegistry();

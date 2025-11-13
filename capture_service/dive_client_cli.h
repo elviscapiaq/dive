@@ -16,19 +16,6 @@ limitations under the License.
 
 #pragma once
 
-#include "absl/flags/flag.h"
-#include "absl/flags/internal/flag.h"
-#include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
-#include "absl/strings/str_format.h"
-#include "absl/strings/str_split.h"
-#include "android_application.h"
-#include "command_utils.h"
-#include "constants.h"
-#include "device_mgr.h"
-#include "network/tcp_client.h"
-#include "absl/strings/str_cat.h"
-
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -36,6 +23,20 @@ limitations under the License.
 #include <string>
 #include <system_error>
 #include <thread>
+
+#include "absl/flags/flag.h"
+#include "absl/flags/internal/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+
+#include "android_application.h"
+#include "command_utils.h"
+#include "constants.h"
+#include "device_mgr.h"
+#include "network/tcp_client.h"
 
 struct GlobalOptions
 {
